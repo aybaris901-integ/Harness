@@ -8,7 +8,12 @@ dependencies = [
     "aiosqlite>=0.20",
     "httpx>=0.27",
     "python-dotenv>=1.0",
+    "trafilatura>=2.0",
+    "yt-dlp>=2025.1.1",
 ]
+
+[project.optional-dependencies]
+local-stt = ["faster-whisper>=1.1"]
 
 [project.scripts]
 harness-bot = "main:main"

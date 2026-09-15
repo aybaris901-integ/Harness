@@ -1,17 +1,23 @@
 """The harness: the only component that talks to both the bot layer and the
 tools/LLM layer (CLAUDE.md §2).
 
-Phase 1 has exactly one route — the tutor — and no tools. Later phases add
-intent routing and tool pipelines here; handlers keep calling only this class.
+Routes so far:
+
+- tutor (Phase 1): pure prompting, FSM-driven dialogue
+- links (Phase 2): article / video summarizer, delegated to `harness.links`
+
+Handlers call only this class; pipeline logic lives in `tools/`.
 """
 
 from __future__ import annotations
 
 import logging
 
+from harness.links import LinkSummarizer, LinkSummary, ProgressCallback
 from harness.prompts import TUTOR_SYSTEM_PROMPT, TUTOR_TOPIC_INSTRUCTION
 from llm_router import AllProvidersFailedError, LLMRouter
 from storage import Storage
+from tools.urls import LinkKind
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +31,48 @@ class HarnessError(RuntimeError):
 
 
 class Harness:
-    def __init__(self, *, router: LLMRouter, storage: Storage, history_limit: int = 20) -> None:
+    def __init__(
+        self,
+        *,
+        router: LLMRouter,
+        storage: Storage,
+        history_limit: int = 20,
+        links: LinkSummarizer | None = None,
+    ) -> None:
         self.router = router
         self.storage = storage
         self.history_limit = history_limit
+        self.links = links
+
+    # -- links (Phase 2) ----------------------------------------------------
+
+    def link_kind(self, url: str) -> LinkKind:
+        return LinkSummarizer.classify(url)
+
+    async def summarize_link(
+        self,
+        *,
+        telegram_id: int,
+        chat_id: int,
+        url: str,
+        user_message: str,
+        on_progress: ProgressCallback | None = None,
+    ) -> LinkSummary:
+        """Summarize one URL. `LinkError` carries a user-presentable message."""
+        if self.links is None:
+            raise HarnessError("Пересказ ссылок не настроен.")
+        result = await self.links.summarize(url, user_message=user_message, on_progress=on_progress)
+        # Keep the exchange in history so the tutor can answer follow-up
+        # questions ("explain point 2") about what was just summarized.
+        await self.storage.add_message(
+            telegram_id=telegram_id, chat_id=chat_id, role="user", content=user_message
+        )
+        await self.storage.add_message(
+            telegram_id=telegram_id, chat_id=chat_id, role="assistant", content=result.summary
+        )
+        return result
+
+    # -- tutor (Phase 1) ----------------------------------------------------
 
     async def start_lesson(self, *, telegram_id: int, chat_id: int, topic: str) -> str:
         """Open a tutor session on `topic`. Clears any previous conversation."""

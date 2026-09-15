@@ -112,5 +112,5 @@ async def handle_topic(message: Message, state: FSMContext, harness: Harness) ->
 @router.message()
 async def handle_unsupported(message: Message) -> None:
     await message.answer(
-        "Пока я понимаю только текст. Ссылки, фото и документы появятся в следующих фазах."
+        "Пока я понимаю только текст и ссылки. Фото и документы появятся в следующих фазах."
     )

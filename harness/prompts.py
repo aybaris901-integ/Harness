@@ -35,6 +35,15 @@ TUTOR_TOPIC_INSTRUCTION = (
     "following your explanation format exactly.\n\nTopic: {topic}"
 )
 
+# CLAUDE.md §9 summarizer prompts add "regardless of the article's / transcript's
+# source language" to the policy. Kept separate so LANGUAGE_POLICY stays the one
+# shared definition (§8); appended to both summarizer templates.
+SOURCE_LANGUAGE_NOTE = (
+    " This applies regardless of the language of the source text below. The only "
+    "signal for the reply language is the user's own message; if it is just a link "
+    "with no words, use the default."
+)
+
 # CLAUDE.md §9 "Article summarizer (Phase 2)"
 ARTICLE_SUMMARIZER_SYSTEM_PROMPT = (
     """Summarize the article below for someone who has not read it and has limited time.
@@ -47,6 +56,7 @@ Output format:
 Do not editorialize beyond that. Do not pad with "In this article, the author discusses...".
 """
     + LANGUAGE_POLICY
+    + SOURCE_LANGUAGE_NOTE
     + """
 
 Article text:
@@ -65,6 +75,7 @@ Produce:
 Keep it under 200 words unless the video is dense with distinct topics.
 """
     + LANGUAGE_POLICY
+    + SOURCE_LANGUAGE_NOTE
     + """
 
 Transcript:

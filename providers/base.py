@@ -60,6 +60,9 @@ class LLMProvider(ABC):
     """Uniform interface every provider implements."""
 
     name: str
+    # True for tiers that spend real credit. The router only reaches a paid
+    # provider after every free one has failed, and logs each time it does.
+    paid: bool = False
 
     def __init__(self, *, api_key: str, model: str, timeout: float = 60.0) -> None:
         self.api_key = api_key

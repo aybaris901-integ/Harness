@@ -14,6 +14,7 @@ from providers.gemini import GeminiProvider
 from providers.openai_compatible import (
     GroqProvider,
     OpenAICompatibleProvider,
+    OpenRouterPaidProvider,
     OpenRouterProvider,
 )
 
@@ -25,6 +26,7 @@ __all__ = [
     "InvalidRequest",
     "LLMProvider",
     "OpenAICompatibleProvider",
+    "OpenRouterPaidProvider",
     "OpenRouterProvider",
     "ProviderError",
     "ProviderUnavailable",

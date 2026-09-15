@@ -1,7 +1,9 @@
 """Providers that speak the OpenAI chat-completions dialect: Groq and OpenRouter.
 
 Both are fallbacks in the chain (CLAUDE.md §4), and both accept the same request
-shape, so they share one implementation.
+shape, so they share one implementation. OpenRouter appears twice: once for the
+`:free` pool and once as the paid last resort — same key, same endpoint,
+different model.
 """
 
 from __future__ import annotations
@@ -145,3 +147,14 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                 "X-Title": "Harness Telegram Bot",
             },
         )
+
+
+class OpenRouterPaidProvider(OpenRouterProvider):
+    """Last resort in the chain: a paid OpenRouter model, billed against credit.
+
+    Only reached when Gemini, Groq and the OpenRouter free pool have all failed.
+    Keep the model cheap — this is the one place the bot spends money.
+    """
+
+    name = "openrouter-paid"
+    paid = True

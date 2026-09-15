@@ -3,6 +3,10 @@
 Feature code calls `router.complete(...)` and never touches a provider SDK.
 Free-tier limits tighten without warning, so the router walks a fallback chain:
 rate limits and transient failures move on to the next provider.
+
+The last link in the default chain is a paid tier (`openrouter-paid`). It is
+only reached once every free provider has failed, and every call to it is
+logged at WARNING with a `[PAID]` marker so spend can be tracked from the logs.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from providers import (
     ImagePart,
     InvalidRequest,
     LLMProvider,
+    OpenRouterPaidProvider,
     OpenRouterProvider,
     ProviderError,
     ProviderUnavailable,
@@ -49,6 +54,9 @@ class LLMRouter:
         if not providers:
             raise ValueError("LLMRouter needs at least one provider")
         self.providers = list(providers)
+        # Number of requests that reached a paid provider since startup —
+        # the in-process counterpart of the `[PAID]` log lines.
+        self.paid_calls = 0
 
     async def complete(
         self,
@@ -65,6 +73,18 @@ class LLMRouter:
         errors: dict[str, Exception] = {}
 
         for provider in self.providers:
+            if provider.paid:
+                # This is the only place the bot spends credit. Chain order
+                # guarantees every free provider has already failed by now;
+                # log at WARNING so a grep for "[PAID]" shows how often.
+                self.paid_calls += 1
+                logger.warning(
+                    "[PAID] %s(%s) firing (paid call #%d this process) — free tiers failed: %s",
+                    provider.name,
+                    provider.model,
+                    self.paid_calls,
+                    "; ".join(f"{name}: {err}" for name, err in errors.items()) or "none tried",
+                )
             for attempt in range(1, _RETRIES_PER_PROVIDER + 1):
                 try:
                     text = await provider.complete(
@@ -129,6 +149,8 @@ def _build_provider(config: ProviderConfig, settings: Settings) -> LLMProvider:
         return GroqProvider(**common)
     if config.name == "openrouter":
         return OpenRouterProvider(**common)
+    if config.name == "openrouter-paid":
+        return OpenRouterPaidProvider(**common)
     raise ValueError(f"unknown provider {config.name!r}")
 
 
@@ -136,5 +158,17 @@ def build_router(settings: Settings) -> LLMRouter:
     """Construct the router from settings, in `LLM_PROVIDER_CHAIN` order."""
     configs = settings.enabled_providers()
     providers = [_build_provider(config, settings) for config in configs]
-    logger.info("LLM chain: %s", " -> ".join(f"{c.name}({c.model})" for c in configs) or "(none)")
+    logger.info(
+        "LLM chain: %s",
+        " -> ".join(f"{p.name}({p.model}){' [PAID]' if p.paid else ''}" for p in providers)
+        or "(none)",
+    )
+    # A paid tier is meant to be rare. If LLM_PROVIDER_CHAIN puts it ahead of a
+    # free one, every request would spend credit before trying the free tier.
+    first_paid = next((i for i, p in enumerate(providers) if p.paid), None)
+    if first_paid is not None and any(not p.paid for p in providers[first_paid:]):
+        logger.warning(
+            "LLM_PROVIDER_CHAIN places a paid provider before a free one — "
+            "paid calls will not be a last resort. Check the chain order."
+        )
     return LLMRouter(providers)

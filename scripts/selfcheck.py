@@ -1,7 +1,8 @@
 """Local sanity check — no Telegram, no bot token needed.
 
-python scripts/selfcheck.py          # offline: storage + router fallback logic
-python scripts/selfcheck.py --live   # also sends one real prompt via .env keys
+python scripts/selfcheck.py                 # offline: storage, router, URL/VTT parsing
+python scripts/selfcheck.py --live          # also sends one real prompt via .env keys
+python scripts/selfcheck.py --link <url>    # run the Phase 2 pipeline on one article/video URL
 """
 
 from __future__ import annotations
@@ -18,15 +19,18 @@ from harness.prompts import TUTOR_SYSTEM_PROMPT  # noqa: E402
 from llm_router import AllProvidersFailedError, LLMRouter  # noqa: E402
 from providers.base import ChatMessage, LLMProvider, RateLimitError  # noqa: E402
 from storage import Storage, UserProfile  # noqa: E402
+from tools.transcript import Segment, format_transcript, parse_vtt  # noqa: E402
+from tools.urls import LinkKind, classify_url, extract_urls  # noqa: E402
 
 
 class StubProvider(LLMProvider):
     """Provider that either always fails or always answers, for wiring tests."""
 
-    def __init__(self, name: str, *, reply: str | None = None) -> None:
+    def __init__(self, name: str, *, reply: str | None = None, paid: bool = False) -> None:
         super().__init__(api_key="stub", model="stub")
         self.name = name
         self.reply = reply
+        self.paid = paid
         self.calls = 0
 
     async def complete(self, *, prompt: str, system=None, history=None, **_kwargs) -> str:
@@ -86,10 +90,102 @@ async def offline_checks() -> None:
                 check("all-providers-failed names each provider", set(exc.errors) == {"a", "b"})
             else:
                 check("all-providers-failed raised", False)
+
+            print("\nPaid tier:")
+            free_ok = StubProvider("free", reply="free answer")
+            paid = StubProvider("paid", reply="paid answer", paid=True)
+            router = LLMRouter([free_ok, paid])
+            await router.complete("hi")
+            check("paid tier not called while a free one works", paid.calls == 0)
+            check("paid counter stays at zero", router.paid_calls == 0)
+
+            paid = StubProvider("paid", reply="paid answer", paid=True)
+            router = LLMRouter([StubProvider("free-a"), StubProvider("free-b"), paid])
+            reply = await router.complete("hi")
+            check("paid tier reached only after all free tiers fail", reply.startswith("paid"))
+            check("paid calls are counted", router.paid_calls == 1)
         finally:
             # aiosqlite runs a non-daemon worker thread; without this the
             # process hangs on exit when a check fails.
             await storage.close()
+
+
+def phase2_offline_checks() -> None:
+    print("\nURL detection:")
+    urls = extract_urls("see https://example.com/a?x=1, and www.youtu.be/abc). ok")
+    check("extracts both URLs", urls == ["https://example.com/a?x=1", "https://www.youtu.be/abc"])
+    check("trailing punctuation trimmed", not urls[0].endswith(","))
+    check("no URL -> empty list", extract_urls("just text") == [])
+    check("youtube is video", classify_url("https://m.youtube.com/watch?v=x") is LinkKind.VIDEO)
+    check("youtu.be is video", classify_url("https://youtu.be/x") is LinkKind.VIDEO)
+    check("tiktok is video", classify_url("https://vm.tiktok.com/ZM/") is LinkKind.VIDEO)
+    check("blog is article", classify_url("https://blog.example.org/post") is LinkKind.ARTICLE)
+
+    print("\nSubtitle parsing:")
+    vtt = """WEBVTT
+Kind: captions
+Language: en
+
+00:00:00.000 --> 00:00:02.000 align:start position:0%
+hello<00:00:01.000><c> world</c>
+
+00:00:02.000 --> 00:00:04.000
+hello world
+second line
+
+00:01:05.500 --> 00:01:07.000
+much later
+"""
+    segments = parse_vtt(vtt)
+    check(
+        "rolling duplicate lines collapsed",
+        [s.text for s in segments] == ["hello world", "second line", "much later"],
+    )
+    check("timestamps parsed", segments[2].start == 65.5)
+    rendered = format_transcript(segments, window_seconds=30)
+    check("windows rendered with [mm:ss]", rendered.startswith("[00:00] hello world second line"))
+    check("new window after 30s", "[01:05] much later" in rendered)
+    check("hours rendered", format_transcript([Segment(3661, 3662, "x")]).startswith("[1:01:01]"))
+
+
+async def link_check(url: str) -> None:
+    """Run the full Phase 2 pipeline (no Telegram) and print the summary."""
+    from config import load_settings
+    from harness import LinkError, LinkSummarizer
+    from llm_router import build_router
+    from tools.transcriber import Transcriber
+
+    print(f"\nLink pipeline: {url}")
+    settings = load_settings()
+    router = build_router(settings)
+    transcriber = Transcriber(
+        backend=settings.stt_backend,
+        groq_api_key=settings.groq.api_key,
+        groq_model=settings.groq_whisper_model,
+        local_model=settings.whisper_local_model,
+        ffmpeg_path=settings.ffmpeg_path,
+    )
+    print("  " + transcriber.describe())
+    links = LinkSummarizer(
+        router=router,
+        transcriber=transcriber,
+        download_dir=settings.download_dir,
+        max_video_minutes=settings.max_video_minutes,
+    )
+
+    async def progress(text: str) -> None:
+        print(f"  ... {text}")
+
+    try:
+        result = await links.summarize(url, user_message=url, on_progress=progress)
+    except LinkError as exc:
+        check(f"pipeline failed: {exc}", False)
+    finally:
+        await router.aclose()
+    check("summary returned", bool(result.summary.strip()))
+    print(f"\n--- {result.kind.value}: {result.title!r} (source: {result.source}) ---")
+    print(result.summary)
+    print("-------------------")
 
 
 async def live_check() -> None:
@@ -115,7 +211,15 @@ async def live_check() -> None:
 
 
 async def main() -> None:
+    if "--link" in sys.argv:
+        index = sys.argv.index("--link")
+        if index + 1 >= len(sys.argv):
+            raise SystemExit("usage: selfcheck.py --link <url>")
+        await link_check(sys.argv[index + 1])
+        print("\nLink check passed.")
+        return
     await offline_checks()
+    phase2_offline_checks()
     if "--live" in sys.argv:
         await live_check()
     print("\nAll checks passed.")

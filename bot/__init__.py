@@ -19,6 +19,7 @@ from storage import Storage
 
 BOT_COMMANDS = [
     BotCommand(command="tutor", description="Начать урок по теме"),
+    BotCommand(command="summarize", description="Пересказать статью или видео по ссылке"),
     BotCommand(command="reset", description="Очистить историю диалога"),
     BotCommand(command="cancel", description="Выйти из текущего урока"),
     BotCommand(command="help", description="Что умеет бот"),

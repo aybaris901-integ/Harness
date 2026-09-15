@@ -92,6 +92,8 @@ class Settings:
     gemini: ProviderConfig
     groq: ProviderConfig
     openrouter: ProviderConfig
+    # Same key as `openrouter`, but a paid model. Last tier in the default chain.
+    openrouter_paid: ProviderConfig
     provider_chain: tuple[str, ...]
     gemini_thinking_budget: int | None
     db_path: Path
@@ -99,6 +101,14 @@ class Settings:
     request_timeout: float
     allowed_user_ids: frozenset[int]
     log_level: str
+    # --- Phase 2: link/video summarizer ---
+    download_dir: Path
+    # auto = Groq if GROQ_API_KEY is set, else local faster-whisper if installed.
+    stt_backend: str
+    groq_whisper_model: str
+    whisper_local_model: str
+    ffmpeg_path: str | None
+    max_video_minutes: float
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -112,7 +122,15 @@ class Settings:
         db_path = Path(_get("DB_PATH", "data/harness.db") or "data/harness.db")
         if not db_path.is_absolute():
             db_path = BASE_DIR / db_path
+        download_dir = Path(_get("DOWNLOAD_DIR", "data/downloads") or "data/downloads")
+        if not download_dir.is_absolute():
+            download_dir = BASE_DIR / download_dir
 
+        stt_backend = (_get("STT_BACKEND", "auto") or "auto").lower()
+        if stt_backend not in ("auto", "groq", "local"):
+            raise ConfigError(f"STT_BACKEND must be auto, groq or local, got {stt_backend!r}")
+
+        openrouter_api_key = _get("OPENROUTER_API_KEY")
         settings = cls(
             bot_token=bot_token,
             gemini=ProviderConfig(
@@ -127,22 +145,40 @@ class Settings:
             ),
             openrouter=ProviderConfig(
                 name="openrouter",
-                api_key=_get("OPENROUTER_API_KEY"),
+                api_key=openrouter_api_key,
                 model=(
                     _get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
                     or "meta-llama/llama-3.3-70b-instruct:free"
                 ),
             ),
-            provider_chain=_get_csv("LLM_PROVIDER_CHAIN", "gemini,groq,openrouter"),
+            openrouter_paid=ProviderConfig(
+                name="openrouter-paid",
+                api_key=openrouter_api_key,
+                model=(
+                    _get("OPENROUTER_PAID_MODEL", "google/gemini-3.8-flash")
+                    or "google/gemini-3.8-flash"
+                ),
+            ),
+            provider_chain=_get_csv(
+                "LLM_PROVIDER_CHAIN", "gemini,groq,openrouter,openrouter-paid"
+            ),
             gemini_thinking_budget=_get_optional_int("GEMINI_THINKING_BUDGET"),
             db_path=db_path,
             history_limit=_get_int("HISTORY_LIMIT", 20),
             request_timeout=_get_float("LLM_REQUEST_TIMEOUT", 60.0),
             allowed_user_ids=_get_id_set("ALLOWED_USER_IDS"),
             log_level=(_get("LOG_LEVEL", "INFO") or "INFO").upper(),
+            download_dir=download_dir,
+            stt_backend=stt_backend,
+            groq_whisper_model=(
+                _get("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo") or "whisper-large-v3-turbo"
+            ),
+            whisper_local_model=_get("WHISPER_LOCAL_MODEL", "base") or "base",
+            ffmpeg_path=_get("FFMPEG_PATH"),
+            max_video_minutes=_get_float("MAX_VIDEO_MINUTES", 180.0),
         )
 
-        known = {"gemini", "groq", "openrouter"}
+        known = set(settings._providers_by_name())
         unknown = set(settings.provider_chain) - known
         if unknown:
             raise ConfigError(
@@ -156,9 +192,17 @@ class Settings:
             )
         return settings
 
+    def _providers_by_name(self) -> dict[str, ProviderConfig]:
+        return {
+            "gemini": self.gemini,
+            "groq": self.groq,
+            "openrouter": self.openrouter,
+            "openrouter-paid": self.openrouter_paid,
+        }
+
     def enabled_providers(self) -> list[ProviderConfig]:
         """Configured providers in fallback order, skipping any without an API key."""
-        by_name = {"gemini": self.gemini, "groq": self.groq, "openrouter": self.openrouter}
+        by_name = self._providers_by_name()
         return [by_name[name] for name in self.provider_chain if by_name[name].enabled]
 
     def is_user_allowed(self, telegram_id: int) -> bool:
