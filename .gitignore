@@ -34,3 +34,10 @@ Thumbs.db
 # Media scratch space (Phase 2+)
 downloads/
 tmp/
+
+# Claude Code session scratch directories — a per-session UUID folder (e.g.
+# 8d1017ef-17f5-4b6a-97d0-9b9bade0f459/scratchpad/) used for temporary test
+# files/images during a session. Never intended to be committed; a real
+# receipt/document image landed in git history this way once already —
+# see git log b050a47.
+**/scratchpad/
