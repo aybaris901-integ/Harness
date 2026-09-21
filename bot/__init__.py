@@ -11,18 +11,20 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
+import strings
 from bot.handlers import build_root_router
 from bot.middlewares import AccessMiddleware, UserTrackingMiddleware
 from config import Settings
-from harness import Harness
+from harness import DocumentArchive, Harness
 from storage import Storage
 
 BOT_COMMANDS = [
-    BotCommand(command="tutor", description="Начать урок по теме"),
-    BotCommand(command="summarize", description="Пересказать статью или видео по ссылке"),
-    BotCommand(command="reset", description="Очистить историю диалога"),
-    BotCommand(command="cancel", description="Выйти из текущего урока"),
-    BotCommand(command="help", description="Что умеет бот"),
+    BotCommand(command="tutor", description=strings.CMD_TUTOR_DESC),
+    BotCommand(command="summarize", description=strings.CMD_SUMMARIZE_DESC),
+    BotCommand(command="find", description=strings.CMD_FIND_DESC),
+    BotCommand(command="reset", description=strings.CMD_RESET_DESC),
+    BotCommand(command="cancel", description=strings.CMD_CANCEL_DESC),
+    BotCommand(command="help", description=strings.CMD_HELP_DESC),
 ]
 
 
@@ -32,10 +34,14 @@ def create_bot(settings: Settings) -> Bot:
     return Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=None))
 
 
-def create_dispatcher(*, settings: Settings, orchestrator: Harness, storage: Storage) -> Dispatcher:
+def create_dispatcher(
+    *, settings: Settings, orchestrator: Harness, storage: Storage, archive: DocumentArchive
+) -> Dispatcher:
     # MemoryStorage: FSM position resets on restart, which is fine — the actual
     # conversation lives in SQLite and is reloaded on the next turn.
-    dp = Dispatcher(storage=MemoryStorage(), harness=orchestrator, settings=settings)
+    dp = Dispatcher(
+        storage=MemoryStorage(), harness=orchestrator, settings=settings, archive=archive
+    )
 
     dp.message.outer_middleware(AccessMiddleware(settings))
     dp.message.outer_middleware(UserTrackingMiddleware(storage))

@@ -9,3 +9,9 @@ trafilatura>=2.0
 yt-dlp>=2025.1.1
 # Optional, local speech-to-text fallback when GROQ_API_KEY is not set:
 # faster-whisper>=1.1
+
+# Phase 3 - document archive (CLAUDE.md §5: local OCR only, AES-encrypted storage).
+cryptography>=43.0
+pytesseract>=0.3.13
+Pillow>=10.0
+# Also requires the Tesseract OCR binary itself (not a pip package) — see README.

@@ -21,6 +21,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
 
+import strings
 from bot.states import TutorFlow
 from bot.utils import split_message
 from harness import Harness, HarnessError
@@ -28,9 +29,6 @@ from harness import Harness, HarnessError
 logger = logging.getLogger(__name__)
 
 router = Router(name="tutor")
-
-ASK_TOPIC_TEXT = "Какую тему разбираем? Напиши её одним сообщением."
-GENERIC_ERROR_TEXT = "Что-то пошло не так. Попробуй ещё раз."
 
 
 async def _reply(message: Message, text: str) -> None:
@@ -44,7 +42,7 @@ async def _run_turn(message: Message, state: FSMContext, harness: Harness, *, to
     assert message.from_user is not None and message.text is not None
     text = message.text.strip()
     if not text:
-        await message.answer(ASK_TOPIC_TEXT)
+        await message.answer(strings.ASK_TOPIC)
         return
 
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
@@ -62,7 +60,7 @@ async def _run_turn(message: Message, state: FSMContext, harness: Harness, *, to
             return
         except Exception:
             logger.exception("Unexpected failure in tutor turn")
-            await message.answer(GENERIC_ERROR_TEXT)
+            await message.answer(strings.GENERIC_ERROR)
             return
 
     await state.set_state(TutorFlow.in_lesson)
@@ -77,7 +75,7 @@ async def handle_tutor_command(
     topic = (command.args or "").strip()
     if not topic:
         await state.set_state(TutorFlow.waiting_for_topic)
-        await message.answer(ASK_TOPIC_TEXT)
+        await message.answer(strings.ASK_TOPIC)
         return
 
     assert message.from_user is not None
@@ -91,7 +89,7 @@ async def handle_tutor_command(
             return
         except Exception:
             logger.exception("Unexpected failure starting lesson")
-            await message.answer(GENERIC_ERROR_TEXT)
+            await message.answer(strings.GENERIC_ERROR)
             return
 
     await state.set_state(TutorFlow.in_lesson)
@@ -111,6 +109,4 @@ async def handle_topic(message: Message, state: FSMContext, harness: Harness) ->
 
 @router.message()
 async def handle_unsupported(message: Message) -> None:
-    await message.answer(
-        "Пока я понимаю только текст и ссылки. Фото и документы появятся в следующих фазах."
-    )
+    await message.answer(strings.UNSUPPORTED_MESSAGE)

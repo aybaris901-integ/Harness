@@ -9,6 +9,7 @@ from typing import Any
 from aiogram import BaseMiddleware
 from aiogram.types import Message, TelegramObject, User
 
+import strings
 from config import Settings
 from storage import Storage, UserProfile
 
@@ -37,10 +38,7 @@ class AccessMiddleware(BaseMiddleware):
         if not self.settings.is_user_allowed(user.id):
             logger.warning("Blocked user %s (@%s)", user.id, user.username)
             if isinstance(event, Message):
-                await event.answer(
-                    "Этот бот приватный. Если он должен работать для тебя, "
-                    f"добавь ID {user.id} в ALLOWED_USER_IDS."
-                )
+                await event.answer(strings.ACCESS_DENIED.format(user_id=user.id))
             return None
 
         return await handler(event, data)

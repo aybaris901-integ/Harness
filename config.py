@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -73,6 +74,13 @@ def _get_id_set(name: str) -> frozenset[int]:
         raise ConfigError(f"{name} must be a comma-separated list of numeric IDs") from exc
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    raw = _get(name)
+    if raw is None:
+        return default
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderConfig:
     """Everything `llm_router` needs to construct one provider."""
@@ -109,6 +117,16 @@ class Settings:
     whisper_local_model: str
     ffmpeg_path: str | None
     max_video_minutes: float
+    # --- Phase 3: document archive ---
+    documents_db_path: Path
+    documents_scan_dir: Path
+    documents_encryption_key: bytes
+    tesseract_cmd: str | None
+    ocr_lang: str
+    ocr_tessdata_dir: str | None
+    document_local_llm_enabled: bool
+    document_local_llm_base_url: str
+    document_local_llm_model: str
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -129,6 +147,35 @@ class Settings:
         stt_backend = (_get("STT_BACKEND", "auto") or "auto").lower()
         if stt_backend not in ("auto", "groq", "local"):
             raise ConfigError(f"STT_BACKEND must be auto, groq or local, got {stt_backend!r}")
+
+        documents_db_path = Path(
+            _get("DOCUMENTS_DB_PATH", "data/documents.db") or "data/documents.db"
+        )
+        if not documents_db_path.is_absolute():
+            documents_db_path = BASE_DIR / documents_db_path
+        documents_scan_dir = Path(
+            _get("DOCUMENTS_SCAN_DIR", "data/document_scans") or "data/document_scans"
+        )
+        if not documents_scan_dir.is_absolute():
+            documents_scan_dir = BASE_DIR / documents_scan_dir
+
+        # CLAUDE.md §5: this key encrypts document scans + PII at rest. It must
+        # come from .env, never be generated silently, and never be logged.
+        raw_key = _get("DOCUMENTS_ENCRYPTION_KEY")
+        if not raw_key:
+            raise ConfigError(
+                "DOCUMENTS_ENCRYPTION_KEY is not set. Generate one with:\n"
+                '  python -c "from cryptography.fernet import Fernet; '
+                'print(Fernet.generate_key().decode())"\n'
+                "and put it in .env. It encrypts document scans and OCR text at rest — "
+                "back it up somewhere other than the VPS, since losing it makes every "
+                "stored document unrecoverable."
+            )
+        try:
+            documents_encryption_key = raw_key.encode("ascii")
+            Fernet(documents_encryption_key)
+        except (ValueError, UnicodeEncodeError) as exc:
+            raise ConfigError(f"DOCUMENTS_ENCRYPTION_KEY is not a valid Fernet key: {exc}") from exc
 
         openrouter_api_key = _get("OPENROUTER_API_KEY")
         settings = cls(
@@ -176,6 +223,18 @@ class Settings:
             whisper_local_model=_get("WHISPER_LOCAL_MODEL", "base") or "base",
             ffmpeg_path=_get("FFMPEG_PATH"),
             max_video_minutes=_get_float("MAX_VIDEO_MINUTES", 180.0),
+            documents_db_path=documents_db_path,
+            documents_scan_dir=documents_scan_dir,
+            documents_encryption_key=documents_encryption_key,
+            tesseract_cmd=_get("TESSERACT_CMD"),
+            ocr_lang=_get("OCR_LANG", "eng") or "eng",
+            ocr_tessdata_dir=_get("OCR_TESSDATA_DIR"),
+            document_local_llm_enabled=_get_bool("DOCUMENT_LOCAL_LLM_ENABLED", False),
+            document_local_llm_base_url=(
+                _get("DOCUMENT_LOCAL_LLM_BASE_URL", "http://localhost:11434")
+                or "http://localhost:11434"
+            ),
+            document_local_llm_model=_get("DOCUMENT_LOCAL_LLM_MODEL", "llama3.2") or "llama3.2",
         )
 
         known = set(settings._providers_by_name())

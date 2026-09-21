@@ -1,8 +1,12 @@
 """Local sanity check — no Telegram, no bot token needed.
 
-python scripts/selfcheck.py                 # offline: storage, router, URL/VTT parsing
+python scripts/selfcheck.py                 # offline: storage, router, URL/VTT, documents
 python scripts/selfcheck.py --live          # also sends one real prompt via .env keys
 python scripts/selfcheck.py --link <url>    # run the Phase 2 pipeline on one article/video URL
+
+Document checks (Phase 3) cover regex field extraction, search scoring and the
+encrypted store's save/search/decrypt roundtrip — all offline, no Tesseract
+binary or LLM required, since none of that pipeline calls out over the network.
 """
 
 from __future__ import annotations
@@ -12,13 +16,21 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Document checks print Kazakh/Russian sample text; Windows terminals default
+# to a legacy codepage (cp1252) that can't encode it and would crash the run.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from cryptography.fernet import Fernet  # noqa: E402
 
 from harness import Harness  # noqa: E402
 from harness.prompts import TUTOR_SYSTEM_PROMPT  # noqa: E402
 from llm_router import AllProvidersFailedError, LLMRouter  # noqa: E402
 from providers.base import ChatMessage, LLMProvider, RateLimitError  # noqa: E402
-from storage import Storage, UserProfile  # noqa: E402
+from storage import DocumentStore, Storage, UserProfile  # noqa: E402
+from tools import document_fields  # noqa: E402
 from tools.transcript import Segment, format_transcript, parse_vtt  # noqa: E402
 from tools.urls import LinkKind, classify_url, extract_urls  # noqa: E402
 
@@ -148,6 +160,149 @@ much later
     check("hours rendered", format_transcript([Segment(3661, 3662, "x")]).startswith("[1:01:01]"))
 
 
+SAMPLE_VEHICLE_OCR = """
+VEHICLE REGISTRATION CERTIFICATE
+VIN: 1HGCM82633A004352
+Plate: 123 ABC 45
+Owner: Aigerim Bekova
+Issue date: 05.03.2021
+"""
+
+SAMPLE_PASSPORT_OCR = """
+PASSPORT / ПАСПОРТ
+IIN: 900101300123
+Surname: Bekov
+Date of birth: 01.01.1990
+"""
+
+# A synthetic (fake data, no real PII) reproduction of the bug report: an
+# OCR pass so badly garbled under the wrong Tesseract language pack that
+# every Cyrillic/Kazakh label is unreadable noise, while the fixed-width TD3
+# MRZ block (bottom two lines) survives intact — exactly like the real
+# passport that got extracted fields but document_type="unknown".
+SAMPLE_GARBLED_PASSPORT_OCR = """
+�SITbI / HAUMOHAIbHOCTb
+sie SS  ~~
+| eee awe DK
+�TYPI/ TYPE MEMMEKET KOJIbI
+Bah AE a9 a KAZ ail
+MACTIOPT MEPSIMI/ DATE OF EXPIRY
+25.06.2029
+
+P<KAZTESTOV<<TESTBEK<<<<<<<<<<<<<<<<<<<<<<<<<
+N000000015KAZ9001010F3001010990101300123<<00
+"""
+
+
+def phase3_offline_checks() -> None:
+    """Regex/heuristic extraction — no Tesseract, no LLM (CLAUDE.md §5/§9)."""
+    print("\nDocument field extraction:")
+    vehicle = document_fields.extract_fields(SAMPLE_VEHICLE_OCR)
+    check("vehicle registration type detected", vehicle.document_type == "vehicle_registration")
+    check("VIN extracted", vehicle.fields.get("vin") == "1HGCM82633A004352")
+    check("plate extracted", vehicle.fields.get("plate_number") == "123ABC45")
+    check(
+        "issue date canonicalized regardless of label wording",
+        vehicle.fields.get("date_of_issue") == "05.03.2021",
+    )
+
+    passport = document_fields.extract_fields(SAMPLE_PASSPORT_OCR)
+    check("passport type detected", passport.document_type == "passport")
+    check("IIN extracted", passport.fields.get("iin") == "900101300123")
+    check("surname canonicalized", passport.fields.get("surname") == "Bekov")
+    check("date of birth canonicalized", passport.fields.get("date_of_birth") == "01.01.1990")
+
+    print("\nMRZ extraction (regression: type must agree with extracted fields):")
+    garbled = document_fields.extract_fields(SAMPLE_GARBLED_PASSPORT_OCR)
+    check(
+        "type is 'passport', not 'unknown', once MRZ fields are extracted",
+        garbled.document_type == "passport",
+    )
+    check("MRZ document number extracted", garbled.fields.get("document_number") == "N00000001")
+    check("MRZ nationality extracted", garbled.fields.get("nationality") == "KAZ")
+    check("MRZ date of birth extracted", garbled.fields.get("date_of_birth") == "01.01.1990")
+    check("MRZ sex extracted", garbled.fields.get("sex") == "F")
+    check("MRZ date of expiry extracted", garbled.fields.get("date_of_expiry") == "01.01.2030")
+    check("MRZ personal number stored as iin", garbled.fields.get("iin") == "990101300123")
+    check(
+        "needs_local_llm_fallback is False once MRZ classified the document",
+        not document_fields.needs_local_llm_fallback(garbled),
+    )
+
+    print("\nDocument search scoring:")
+    vehicle_fields = ["vin", "plate_number"]
+    score, matched = document_fields.score_query(
+        "көлік тіркеу нөмірін жібер",
+        document_type="vehicle_registration",
+        field_names=vehicle_fields,
+    )
+    check("vehicle query scores positive on type keyword", score > 0)
+    score2, matched2 = document_fields.score_query(
+        "vin көрсет", document_type="vehicle_registration", field_names=vehicle_fields
+    )
+    check("vin field name matched directly", "vin" in matched2)
+    unrelated_score, _ = document_fields.score_query(
+        "паспорт нөмірі", document_type="vehicle_registration", field_names=["vin"]
+    )
+    check("passport query does not match vehicle doc", unrelated_score == 0)
+
+    print("\nMultilingual document-type search (кк/ru/en all resolve the same way):")
+    passport_fields = ["iin", "document_number"]
+    for query in ("паспорт", "passport", "жеке куәлік"):
+        score, _ = document_fields.score_query(
+            query, document_type="passport", field_names=passport_fields
+        )
+        check(f"{query!r} matches document_type=passport", score > 0)
+
+    print("\nSearch is not gated on document_type when fields exist:")
+    score, matched = document_fields.score_query(
+        "иин", document_type="unknown", field_names=["iin", "date"]
+    )
+    check("an 'unknown'-type document is still findable by its field data", score > 0)
+    check("the matched field is reported", "iin" in matched)
+
+
+async def document_store_offline_check() -> None:
+    """Encrypted save -> search -> load_scan roundtrip (CLAUDE.md §7 Phase 3)."""
+    print("\nDocument store (encrypted):")
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        store = DocumentStore(
+            db_path=Path(tmp) / "documents.db",
+            scan_dir=Path(tmp) / "scans",
+            encryption_key=Fernet.generate_key(),
+        )
+        await store.connect()
+        try:
+            fake_scan = b"not a real jpeg, just bytes for the roundtrip test"
+            record = await store.save(
+                telegram_id=1,
+                document_type="vehicle_registration",
+                fields={"vin": "1HGCM82633A004352", "plate_number": "123ABC45"},
+                raw_text=SAMPLE_VEHICLE_OCR,
+                image_bytes=fake_scan,
+            )
+            check("save assigns an id", record.id > 0)
+
+            on_disk = record.scan_path.read_bytes()
+            check("scan is encrypted at rest", on_disk != fake_scan)
+
+            match = await store.search(telegram_id=1, query="көлік vin нөмірі")
+            found_right_doc = match is not None and match.record.id == record.id
+            check("search finds the stored document", found_right_doc)
+            check("search decrypts the fields", match.record.fields["vin"] == "1HGCM82633A004352")
+
+            no_match = await store.search(telegram_id=1, query="паспорт")
+            check("unrelated query finds nothing", no_match is None)
+
+            other_user = await store.search(telegram_id=2, query="vin")
+            check("documents are isolated per user", other_user is None)
+
+            scan_bytes = await store.load_scan(record)
+            check("decrypted scan matches the original bytes", scan_bytes == fake_scan)
+        finally:
+            await store.close()
+
+
 async def link_check(url: str) -> None:
     """Run the full Phase 2 pipeline (no Telegram) and print the summary."""
     from config import load_settings
@@ -220,6 +375,8 @@ async def main() -> None:
         return
     await offline_checks()
     phase2_offline_checks()
+    phase3_offline_checks()
+    await document_store_offline_check()
     if "--live" in sys.argv:
         await live_check()
     print("\nAll checks passed.")

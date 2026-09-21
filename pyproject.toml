@@ -10,6 +10,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "trafilatura>=2.0",
     "yt-dlp>=2025.1.1",
+    "cryptography>=43.0",
+    "pytesseract>=0.3.13",
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]

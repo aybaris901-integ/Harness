@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 
+import strings
 from harness.links import LinkSummarizer, LinkSummary, ProgressCallback
 from harness.prompts import TUTOR_SYSTEM_PROMPT, TUTOR_TOPIC_INSTRUCTION
 from llm_router import AllProvidersFailedError, LLMRouter
@@ -60,7 +61,7 @@ class Harness:
     ) -> LinkSummary:
         """Summarize one URL. `LinkError` carries a user-presentable message."""
         if self.links is None:
-            raise HarnessError("Пересказ ссылок не настроен.")
+            raise HarnessError(strings.LINKS_NOT_CONFIGURED)
         result = await self.links.summarize(url, user_message=user_message, on_progress=on_progress)
         # Keep the exchange in history so the tutor can answer follow-up
         # questions ("explain point 2") about what was just summarized.
@@ -106,9 +107,7 @@ class Harness:
             )
         except AllProvidersFailedError as exc:
             logger.error("tutor turn failed for user %s: %s", telegram_id, exc)
-            raise HarnessError(
-                "Все LLM-провайдеры сейчас недоступны. Попробуй ещё раз через минуту."
-            ) from exc
+            raise HarnessError(strings.ALL_PROVIDERS_FAILED) from exc
 
         # Store what the student actually typed, not the wrapped prompt, so the
         # history stays a faithful transcript.

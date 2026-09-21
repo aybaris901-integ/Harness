@@ -11,9 +11,9 @@ import sys
 
 from bot import create_bot, create_dispatcher, set_bot_commands
 from config import ConfigError, Settings, load_settings
-from harness import Harness, LinkSummarizer
+from harness import DocumentArchive, Harness, LinkSummarizer
 from llm_router import build_router
-from storage import Storage
+from storage import DocumentStore, Storage
 from tools.transcriber import Transcriber
 
 logger = logging.getLogger("harness")
@@ -36,6 +36,23 @@ async def run(settings: Settings) -> None:
     storage = Storage(settings.db_path)
     await storage.connect()
 
+    document_store = DocumentStore(
+        db_path=settings.documents_db_path,
+        scan_dir=settings.documents_scan_dir,
+        encryption_key=settings.documents_encryption_key,
+    )
+    await document_store.connect()
+    archive = DocumentArchive(
+        store=document_store,
+        tesseract_cmd=settings.tesseract_cmd,
+        ocr_lang=settings.ocr_lang,
+        ocr_tessdata_dir=settings.ocr_tessdata_dir,
+        local_llm_enabled=settings.document_local_llm_enabled,
+        local_llm_base_url=settings.document_local_llm_base_url,
+        local_llm_model=settings.document_local_llm_model,
+    )
+    logger.info(archive.describe())
+
     llm = build_router(settings)
     transcriber = Transcriber(
         backend=settings.stt_backend,
@@ -56,7 +73,9 @@ async def run(settings: Settings) -> None:
     )
 
     bot = create_bot(settings)
-    dp = create_dispatcher(settings=settings, orchestrator=orchestrator, storage=storage)
+    dp = create_dispatcher(
+        settings=settings, orchestrator=orchestrator, storage=storage, archive=archive
+    )
 
     try:
         me = await bot.get_me()
@@ -72,6 +91,7 @@ async def run(settings: Settings) -> None:
     finally:
         await llm.aclose()
         await storage.close()
+        await document_store.close()
         await bot.session.close()
         logger.info("Shut down cleanly")
 

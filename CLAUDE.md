@@ -114,6 +114,7 @@ Build and test one feature at a time; each phase should be a separate Claude Cod
 - Secrets only via `.env` / environment variables
 - Prefer explicit routing logic over "let the LLM decide everything" for anything touching PII or file storage
 - Language policy is shared across all prompts (tutor, summarizers, future features) — define it once as a `LANGUAGE_POLICY` constant in `prompts.py` and append it to every system prompt, rather than repeating the wording in each template. Current policy: **Kazakh by default, English if the user writes in English, never Russian.**
+- LANGUAGE_POLICY applies to every user-facing string, not just LLM prompts. Static text that never goes through `llm_router.py` — command replies (`/start`, `/help`, `/cancel`, `/reset`, `/tutor`), unsupported-input notices, whitelist/access-rejection messages, rate-limit messages, BotCommand menu descriptions, and any `HarnessError`/`LinkError` message raised by pipeline code — must live in the single `strings.py` module, never inline in handlers or tools. Since these are triggered by non-text input (commands, photos, access checks) with no user text to detect language from, they default to Kazakh, never Russian, no exceptions.
 
 ## 9. Prompt templates
 

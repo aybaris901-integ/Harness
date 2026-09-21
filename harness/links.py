@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+import strings
 from llm_router import AllProvidersFailedError, LLMRouter
 from tools import article as article_tool
 from tools import downloader, summarizer, transcript
@@ -87,7 +88,7 @@ class LinkSummarizer:
         try:
             article = await article_tool.load_article(url)
         except ArticleError as exc:
-            raise LinkError(f"Не удалось прочитать страницу: {exc}") from exc
+            raise LinkError(strings.ARTICLE_READ_FAILED.format(error=exc)) from exc
         summary = await self._complete(
             summarizer.summarize_article(self.router, article, user_message=user_message)
         )
@@ -123,17 +124,17 @@ class LinkSummarizer:
         except NotAVideo:
             raise
         except DownloadFailed as exc:
-            raise LinkError(f"Не удалось получить видео: {exc}") from exc
+            raise LinkError(strings.VIDEO_FETCH_FAILED.format(error=exc)) from exc
 
         if info.is_live:
-            raise LinkError("Это прямая трансляция — её нельзя пересказать, пока она идёт.")
+            raise LinkError(strings.LIVESTREAM_NOT_SUPPORTED)
 
         segments: list[transcript.Segment] = []
         source = ""
         track = info.best_subtitle()
         if track is not None:
             source = f"{'auto-captions' if track.automatic else 'subtitles'} ({track.lang})"
-            await _report(on_progress, f"Нашёл субтитры ({track.lang}), читаю…")
+            await _report(on_progress, strings.SUBTITLES_FOUND.format(lang=track.lang))
             try:
                 segments = await downloader.fetch_subtitles(
                     url, track, work_dir, ffmpeg_path=ffmpeg
@@ -145,7 +146,7 @@ class LinkSummarizer:
         if not segments:
             segments, source = await self._transcribe(info, work_dir, on_progress=on_progress)
 
-        await _report(on_progress, "Составляю пересказ…")
+        await _report(on_progress, strings.BUILDING_SUMMARY)
         transcript_text = transcript.format_transcript(segments)
         summary = await self._complete(
             summarizer.summarize_video(
@@ -168,37 +169,35 @@ class LinkSummarizer:
         on_progress: ProgressCallback | None,
     ) -> tuple[list[transcript.Segment], str]:
         if not self.transcriber.available:
-            raise LinkError(
-                "У видео нет субтитров, а распознавание речи не настроено "
-                "(нужен GROQ_API_KEY или faster-whisper)."
-            )
+            raise LinkError(strings.STT_NOT_CONFIGURED)
         minutes = info.duration_minutes
         if minutes is not None and minutes > self.max_video_minutes:
             raise LinkError(
-                f"У видео нет субтитров, а оно слишком длинное для распознавания "
-                f"({minutes:.0f} мин, лимит {self.max_video_minutes:.0f})."
+                strings.VIDEO_TOO_LONG_FOR_STT.format(
+                    minutes=minutes, limit=self.max_video_minutes
+                )
             )
 
-        length = f" ({minutes:.0f} мин)" if minutes else ""
-        await _report(on_progress, f"Субтитров нет. Скачиваю аудио{length}…")
+        length = strings.AUDIO_LENGTH_SUFFIX.format(minutes=minutes) if minutes else ""
+        await _report(on_progress, strings.DOWNLOADING_AUDIO.format(length=length))
         try:
             audio_path = await downloader.fetch_audio(
                 info.url, work_dir, ffmpeg_path=self.transcriber.ffmpeg
             )
         except DownloadFailed as exc:
-            raise LinkError(f"Не удалось скачать аудио: {exc}") from exc
+            raise LinkError(strings.AUDIO_DOWNLOAD_FAILED.format(error=exc)) from exc
 
-        await _report(on_progress, "Распознаю речь…")
+        await _report(on_progress, strings.TRANSCRIBING)
 
         async def chunk_progress(done: str) -> None:
-            await _report(on_progress, f"Распознаю речь… часть {done}")
+            await _report(on_progress, strings.TRANSCRIBING_PART.format(done=done))
 
         try:
             segments = await self.transcriber.transcribe(
                 audio_path, work_dir, on_progress=chunk_progress
             )
         except TranscriptionError as exc:
-            raise LinkError(f"Не удалось распознать речь: {exc}") from exc
+            raise LinkError(strings.TRANSCRIPTION_FAILED.format(error=exc)) from exc
         backend = "groq" if self.transcriber.groq_enabled else "faster-whisper"
         return segments, f"speech-to-text ({backend})"
 
@@ -210,9 +209,7 @@ class LinkSummarizer:
             return await call
         except AllProvidersFailedError as exc:
             logger.error("summary failed: %s", exc)
-            raise LinkError(
-                "Все LLM-провайдеры сейчас недоступны. Попробуй ещё раз через минуту."
-            ) from exc
+            raise LinkError(strings.ALL_PROVIDERS_FAILED) from exc
 
 
 async def _report(on_progress: ProgressCallback | None, text: str) -> None:

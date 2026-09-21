@@ -23,6 +23,7 @@ from aiogram.filters import BaseFilter, Command, CommandObject
 from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
 
+import strings
 from bot.utils import split_message
 from harness import Harness, HarnessError, LinkError, LinkSummary
 from tools.urls import LinkKind, extract_urls
@@ -30,10 +31,6 @@ from tools.urls import LinkKind, extract_urls
 logger = logging.getLogger(__name__)
 
 router = Router(name="links")
-
-PROCESSING_TEXT = "⏳ Видео принято, обрабатываю…"
-GENERIC_ERROR_TEXT = "Не получилось обработать ссылку. Попробуй ещё раз."
-USAGE_TEXT = "Пришли ссылку: /summarize https://…"
 
 # asyncio only keeps weak references to tasks; hold them so a running video
 # job is never garbage-collected mid-flight.
@@ -85,13 +82,13 @@ async def _handle_article(message: Message, harness: Harness, url: str, user_mes
             return
         except Exception:
             logger.exception("Unexpected failure summarizing article %s", url)
-            await message.answer(GENERIC_ERROR_TEXT)
+            await message.answer(strings.LINK_GENERIC_ERROR)
             return
     await _send_summary(message, result)
 
 
 async def _handle_video(message: Message, harness: Harness, url: str, user_message: str) -> None:
-    status = await message.answer(PROCESSING_TEXT)
+    status = await message.answer(strings.VIDEO_PROCESSING)
     task = asyncio.create_task(
         _video_job(message, status, harness, url, user_message),
         name=f"video-summary:{message.chat.id}:{message.message_id}",
@@ -127,7 +124,7 @@ async def _video_job(
         return
     except Exception:
         logger.exception("Unexpected failure summarizing video %s", url)
-        await _finish(bot, status, f"⚠️ {GENERIC_ERROR_TEXT}")
+        await _finish(bot, status, f"⚠️ {strings.LINK_GENERIC_ERROR}")
         return
 
     chunks = split_message(_header(result) + result.summary)
@@ -146,7 +143,7 @@ async def _finish(bot: Bot, status: Message, text: str) -> None:
 
 async def _dispatch(message: Message, harness: Harness, urls: list[str], user_message: str) -> None:
     if len(urls) > 1:
-        await message.answer("Беру первую ссылку из сообщения, остальные пропускаю.")
+        await message.answer(strings.MULTIPLE_URLS_NOTICE)
     url = urls[0]
     if harness.link_kind(url) is LinkKind.VIDEO:
         await _handle_video(message, harness, url, user_message)
@@ -161,7 +158,7 @@ async def handle_summarize_command(
     args = (command.args or "").strip()
     urls = extract_urls(args)
     if not urls:
-        await message.answer(USAGE_TEXT)
+        await message.answer(strings.SUMMARIZE_USAGE)
         return
     # Pass only the arguments: "/summarize" itself must not count as an English
     # word when the reply language is picked from the user's message.
