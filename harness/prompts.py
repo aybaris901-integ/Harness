@@ -81,3 +81,45 @@ Keep it under 200 words unless the video is dense with distinct topics.
 Transcript:
 {transcript_text}"""
 )
+
+# Phase 4 has no prescribed prompt template in CLAUDE.md §9 (only Phases 1/2/3/5
+# have one) — these two are written from scratch, following the exact same
+# shape as the Phase 2 prompts above: task instructions + LANGUAGE_POLICY (+
+# SOURCE_LANGUAGE_NOTE, since the source text embedded below can be in any
+# language regardless of the user's own message).
+
+MEDIA_DESCRIPTION_SYSTEM_PROMPT = (
+    """Below is metadata for a media file that was just downloaded, titled "{title}".
+
+Produce:
+- A short description (2-4 sentences) of what this media is likely about, based only on the title, uploader and description given below.
+- If chapter markers are present in the metadata, list them as a timestamped outline: one line per chapter, format [mm:ss] Chapter title.
+
+Do not invent chapters, timestamps or content that isn't implied by the metadata below.
+"""
+    + LANGUAGE_POLICY
+    + SOURCE_LANGUAGE_NOTE
+    + """
+
+Metadata:
+{metadata_text}"""
+)
+
+SCREENSHOT_NOTE_SYSTEM_PROMPT = (
+    """The text below was OCR'd from a screenshot (a whiteboard, code, class notes, or similar non-sensitive image — never a personal document like a passport or contract; those go through a separate, fully local pipeline and never reach this prompt). OCR errors are possible.
+
+The text is stored verbatim exactly as it is — your only job is to label it:
+- A short, specific title (3-8 words) describing what the text is about.
+- 0-5 short topic tags.
+
+Do not rewrite, correct, translate or transliterate the text; it is not part of your output.
+
+Return only the fields requested by the response schema — no extra prose, no markdown fences around the JSON itself.
+"""
+    + LANGUAGE_POLICY
+    + SOURCE_LANGUAGE_NOTE
+    + """
+
+OCR text:
+{ocr_text}"""
+)

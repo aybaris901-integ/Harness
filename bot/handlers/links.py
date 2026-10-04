@@ -1,7 +1,10 @@
 """Link summarizer (CLAUDE.md §7 Phase 2).
 
-Any message containing a URL — in any FSM state — lands here, before the tutor
-router gets a chance. `/summarize <url>` does the same explicitly.
+Any non-command message containing a URL — in any FSM state — lands here,
+before the tutor router gets a chance. `/summarize <url>` does the same
+explicitly. Messages starting with a bot command are never claimed by the
+generic URL handler, whatever the router order: `/download <url>`,
+`/find <url>`, a photo captioned `/note <url>` belong to their own handlers.
 
 - Article links are handled inline: fetch + summarize takes a few seconds, so
   a "typing" indicator is enough.
@@ -24,7 +27,7 @@ from aiogram.types import Message
 from aiogram.utils.chat_action import ChatActionSender
 
 import strings
-from bot.utils import split_message
+from bot.formatting import answer_html, edit_html, render_chunks
 from harness import Harness, HarnessError, LinkError, LinkSummary
 from tools.urls import LinkKind, extract_urls
 
@@ -38,9 +41,13 @@ _background_tasks: set[asyncio.Task[Any]] = set()
 
 
 class HasUrl(BaseFilter):
-    """Matches messages with a URL in the text; passes the URLs to the handler."""
+    """Matches non-command messages with a URL in the text; passes the URLs to
+    the handler. Commands are excluded here rather than relying on router
+    order — this is the catch-all, it must never shadow `/download <url>`."""
 
     async def __call__(self, message: Message) -> bool | dict[str, list[str]]:
+        if (message.text or message.caption or "").lstrip().startswith("/"):
+            return False
         urls = _urls_from_message(message)
         return {"urls": urls} if urls else False
 
@@ -55,16 +62,14 @@ def _urls_from_message(message: Message) -> list[str]:
     return urls
 
 
-def _header(result: LinkSummary) -> str:
+def _summary_chunks(result: LinkSummary) -> list[str]:
     icon = "🎬" if result.kind is LinkKind.VIDEO else "📄"
-    title = result.title or result.url
-    return f"{icon} {title}\n\n"
+    return render_chunks(result.summary, header=f"{icon} {result.title or result.url}")
 
 
 async def _send_summary(message: Message, result: LinkSummary) -> None:
-    chunks = split_message(_header(result) + result.summary)
-    for chunk in chunks:
-        await message.answer(chunk)
+    for chunk in _summary_chunks(result):
+        await answer_html(message, chunk)
 
 
 async def _handle_article(message: Message, harness: Harness, url: str, user_message: str) -> None:
@@ -127,11 +132,11 @@ async def _video_job(
         await _finish(bot, status, f"⚠️ {strings.LINK_GENERIC_ERROR}")
         return
 
-    chunks = split_message(_header(result) + result.summary)
+    chunks = _summary_chunks(result)
     # The first chunk replaces the status message; the rest follow as replies.
-    await _finish(bot, status, chunks[0])
+    await edit_html(bot, status, chunks[0])
     for chunk in chunks[1:]:
-        await message.answer(chunk)
+        await answer_html(message, chunk)
 
 
 async def _finish(bot: Bot, status: Message, text: str) -> None:
@@ -160,9 +165,9 @@ async def handle_summarize_command(
     if not urls:
         await message.answer(strings.SUMMARIZE_USAGE)
         return
-    # Pass only the arguments: "/summarize" itself must not count as an English
-    # word when the reply language is picked from the user's message.
-    await _dispatch(message, harness, urls, user_message=args)
+    # Raw text is fine: tools.language.user_words strips "/summarize" (and the
+    # URL) before the reply language is picked.
+    await _dispatch(message, harness, urls, user_message=(message.text or "").strip())
 
 
 @router.message(F.text | F.caption, HasUrl())

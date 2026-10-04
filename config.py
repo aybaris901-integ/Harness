@@ -127,6 +127,10 @@ class Settings:
     document_local_llm_enabled: bool
     document_local_llm_base_url: str
     document_local_llm_model: str
+    # --- Phase 4: media pipeline extras ---
+    notes_db_path: Path
+    media_max_download_mb: float
+    media_max_concurrent: int
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -159,6 +163,10 @@ class Settings:
         if not documents_scan_dir.is_absolute():
             documents_scan_dir = BASE_DIR / documents_scan_dir
 
+        notes_db_path = Path(_get("NOTES_DB_PATH", "data/notes.db") or "data/notes.db")
+        if not notes_db_path.is_absolute():
+            notes_db_path = BASE_DIR / notes_db_path
+
         # CLAUDE.md §5: this key encrypts document scans + PII at rest. It must
         # come from .env, never be generated silently, and never be logged.
         raw_key = _get("DOCUMENTS_ENCRYPTION_KEY")
@@ -188,7 +196,10 @@ class Settings:
             groq=ProviderConfig(
                 name="groq",
                 api_key=_get("GROQ_API_KEY"),
-                model=_get("GROQ_MODEL", "llama-3.3-70b-versatile") or "llama-3.3-70b-versatile",
+                # llama-3.3-70b-versatile was deprecated by Groq on 2026-08-16
+                # (HTTP 404 "does not exist"); verified openai/gpt-oss-120b is
+                # live via GET https://api.groq.com/openai/v1/models.
+                model=_get("GROQ_MODEL", "openai/gpt-oss-120b") or "openai/gpt-oss-120b",
             ),
             openrouter=ProviderConfig(
                 name="openrouter",
@@ -235,6 +246,9 @@ class Settings:
                 or "http://localhost:11434"
             ),
             document_local_llm_model=_get("DOCUMENT_LOCAL_LLM_MODEL", "llama3.2") or "llama3.2",
+            notes_db_path=notes_db_path,
+            media_max_download_mb=_get_float("MEDIA_MAX_DOWNLOAD_MB", 45.0),
+            media_max_concurrent=_get_int("MEDIA_MAX_CONCURRENT", 2),
         )
 
         known = set(settings._providers_by_name())

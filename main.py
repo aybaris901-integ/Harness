@@ -11,9 +11,9 @@ import sys
 
 from bot import create_bot, create_dispatcher, set_bot_commands
 from config import ConfigError, Settings, load_settings
-from harness import DocumentArchive, Harness, LinkSummarizer
+from harness import DocumentArchive, Harness, LinkSummarizer, MediaPipeline
 from llm_router import build_router
-from storage import DocumentStore, Storage
+from storage import DocumentStore, NoteStore, Storage
 from tools.transcriber import Transcriber
 
 logger = logging.getLogger("harness")
@@ -53,6 +53,9 @@ async def run(settings: Settings) -> None:
     )
     logger.info(archive.describe())
 
+    note_store = NoteStore(settings.notes_db_path)
+    await note_store.connect()
+
     llm = build_router(settings)
     transcriber = Transcriber(
         backend=settings.stt_backend,
@@ -71,10 +74,27 @@ async def run(settings: Settings) -> None:
     orchestrator = Harness(
         router=llm, storage=storage, history_limit=settings.history_limit, links=links
     )
+    media = MediaPipeline(
+        router=llm,
+        download_dir=settings.download_dir,
+        note_store=note_store,
+        ffmpeg_path=settings.ffmpeg_path,
+        tesseract_cmd=settings.tesseract_cmd,
+        ocr_lang=settings.ocr_lang,
+        ocr_tessdata_dir=settings.ocr_tessdata_dir,
+        max_download_mb=settings.media_max_download_mb,
+        max_concurrent_downloads=settings.media_max_concurrent,
+        document_archive=archive,
+    )
+    logger.info(media.describe())
 
     bot = create_bot(settings)
     dp = create_dispatcher(
-        settings=settings, orchestrator=orchestrator, storage=storage, archive=archive
+        settings=settings,
+        orchestrator=orchestrator,
+        storage=storage,
+        archive=archive,
+        media=media,
     )
 
     try:
@@ -92,6 +112,7 @@ async def run(settings: Settings) -> None:
         await llm.aclose()
         await storage.close()
         await document_store.close()
+        await note_store.close()
         await bot.session.close()
         logger.info("Shut down cleanly")
 

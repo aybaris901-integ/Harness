@@ -1,17 +1,26 @@
 """Local sanity check — no Telegram, no bot token needed.
 
-python scripts/selfcheck.py                 # offline: storage, router, URL/VTT, documents
-python scripts/selfcheck.py --live          # also sends one real prompt via .env keys
-python scripts/selfcheck.py --link <url>    # run the Phase 2 pipeline on one article/video URL
+python scripts/selfcheck.py                    # offline: storage, router, URL/VTT, documents, notes
+python scripts/selfcheck.py --live             # also sends one real prompt via .env keys
+python scripts/selfcheck.py --link <url>       # run the Phase 2 pipeline on one article/video URL
+python scripts/selfcheck.py --download <url> [mp3]  # run the Phase 4 downloader on one URL
+python scripts/selfcheck.py --screenshot <path>     # run the Phase 4 screenshot pipeline
 
 Document checks (Phase 3) cover regex field extraction, search scoring and the
 encrypted store's save/search/decrypt roundtrip — all offline, no Tesseract
 binary or LLM required, since none of that pipeline calls out over the network.
+
+Phase 4's offline checks cover the note staging store's roundtrip and the
+screenshot formatter's JSON parsing (via a stub provider) — also no network.
+`--download`/`--screenshot` are the live, real-network/real-OCR equivalents of
+`--link`, since the generalized downloader and screenshot OCR both need a real
+yt-dlp fetch / real Tesseract install to meaningfully exercise.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -29,8 +38,8 @@ from harness import Harness  # noqa: E402
 from harness.prompts import TUTOR_SYSTEM_PROMPT  # noqa: E402
 from llm_router import AllProvidersFailedError, LLMRouter  # noqa: E402
 from providers.base import ChatMessage, LLMProvider, RateLimitError  # noqa: E402
-from storage import DocumentStore, Storage, UserProfile  # noqa: E402
-from tools import document_fields  # noqa: E402
+from storage import DocumentStore, NoteStore, Storage, UserProfile  # noqa: E402
+from tools import document_fields, media_notes  # noqa: E402
 from tools.transcript import Segment, format_transcript, parse_vtt  # noqa: E402
 from tools.urls import LinkKind, classify_url, extract_urls  # noqa: E402
 
@@ -50,6 +59,19 @@ class StubProvider(LLMProvider):
         if self.reply is None:
             raise RateLimitError(self.name, "stub quota exhausted")
         return f"{self.reply} (history={len(history or [])} turns)"
+
+
+class JsonStubProvider(LLMProvider):
+    """Returns text verbatim, no history-turn suffix — for testing callers
+    that parse a structured-output (JSON) reply, like `tools.media_notes`."""
+
+    def __init__(self, reply: str) -> None:
+        super().__init__(api_key="stub", model="stub")
+        self.name = "json-stub"
+        self.reply = reply
+
+    async def complete(self, **_kwargs) -> str:
+        return self.reply
 
 
 def check(label: str, condition: bool) -> None:
@@ -303,6 +325,502 @@ async def document_store_offline_check() -> None:
             await store.close()
 
 
+async def phase4_offline_checks() -> None:
+    """PII safety net + screenshot note formatting — no network, no OCR
+    (CLAUDE.md §7 Phase 4)."""
+    print("\n/note PII safety net (document_fields.has_pii_signals):")
+    check(
+        "passport sample (title-line keyword) flagged",
+        document_fields.has_pii_signals(SAMPLE_PASSPORT_OCR),
+    )
+    check(
+        "garbled passport sample (MRZ only, no readable keyword) flagged",
+        document_fields.has_pii_signals(SAMPLE_GARBLED_PASSPORT_OCR),
+    )
+    check(
+        "vehicle registration sample (VIN pattern) flagged",
+        document_fields.has_pii_signals(SAMPLE_VEHICLE_OCR),
+    )
+    check(
+        "a passport keyword deep in an unrelated form still flags (safety net "
+        "is deliberately more permissive than detect_document_type's title-only rule)",
+        document_fields.has_pii_signals(
+            "Адрес жапсырмасы\nSome field\nSome field\nSome field\nSome field\nSome field\n"
+            "паспорт номер 1111 222222 выдан УФМС"
+        ),
+    )
+    check(
+        "an ordinary whiteboard-note screenshot is NOT flagged",
+        not document_fields.has_pii_signals(
+            "Newton's laws\n1. An object in motion stays in motion.\n"
+            "2. F = ma\n3. Every action has an equal and opposite reaction."
+        ),
+    )
+
+    print("\nScreenshot note labelling (structured-output parsing):")
+    valid_json = json.dumps({"title": "Physics notes", "tags": ["physics"]})
+    router = LLMRouter([JsonStubProvider(valid_json)])
+    note = await media_notes.format_screenshot(router, "raw ocr text", user_message="")
+    check("title parsed", note.title == "Physics notes")
+    check("tags parsed", note.tags == ["physics"])
+    check("the model returns no body — OCR text is never rewritten", not hasattr(note, "markdown"))
+
+    print("\nScreenshot note formatting (invalid JSON is a clean error, not a crash):")
+    bad_router = LLMRouter([JsonStubProvider("not json at all")])
+    try:
+        await media_notes.format_screenshot(bad_router, "raw ocr text", user_message="")
+    except media_notes.ScreenshotFormatError:
+        check("invalid JSON raises ScreenshotFormatError", True)
+    else:
+        check("invalid JSON raises ScreenshotFormatError", False)
+
+    print("\nScreenshot note formatting (empty fields also rejected):")
+    empty_router = LLMRouter([JsonStubProvider(json.dumps({"title": ""}))])
+    try:
+        await media_notes.format_screenshot(empty_router, "raw ocr text", user_message="")
+    except media_notes.ScreenshotFormatError:
+        check("empty title raises ScreenshotFormatError", True)
+    else:
+        check("empty title raises ScreenshotFormatError", False)
+
+
+async def note_store_offline_check() -> None:
+    """Staging-table save/count roundtrip (CLAUDE.md §7 Phase 4) — no search
+    method exists on purpose, see `storage/notes.py`."""
+    print("\nNote staging store:")
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        store = NoteStore(Path(tmp) / "notes.db")
+        await store.connect()
+        try:
+            record = await store.save(
+                telegram_id=1,
+                kind="screenshot",
+                title="Physics notes",
+                content_md="# Newton's laws",
+                content_json=json.dumps({"title": "Physics notes"}),
+                tags=["physics", "notes"],
+            )
+            check("save assigns an id", record.id > 0)
+            check("tags round-trip", record.tags == ["physics", "notes"])
+            check("count reflects the save", await store.count(telegram_id=1) == 1)
+            check("count is per-user", await store.count(telegram_id=2) == 0)
+        finally:
+            await store.close()
+
+
+class CapturingProvider(LLMProvider):
+    """Records every prompt it is sent and answers with fixed Markdown."""
+
+    def __init__(self, reply: str) -> None:
+        super().__init__(api_key="stub", model="stub")
+        self.name = "capturing-stub"
+        self.reply = reply
+        self.prompts: list[str] = []
+
+    async def complete(self, *, prompt: str, **_kwargs) -> str:
+        self.prompts.append(prompt)
+        return self.reply
+
+
+def language_offline_checks() -> None:
+    """Regression for the /note and /download language leaks: command words
+    and URLs are Latin script and must never count as "the user wrote English"."""
+    from tools.language import reply_language, user_words
+
+    print("\nReply language (command prefix + URLs stripped by one shared helper):")
+    cases = [
+        ("/download https://youtu.be/dQw4w9WgXcQ", "Kazakh"),
+        ("/download@HarnessBot https://youtu.be/dQw4w9WgXcQ", "Kazakh"),
+        ("/download www.youtube.com/watch?v=dQw4w9WgXcQ", "Kazakh"),
+        ("/summarize https://example.com/post", "Kazakh"),
+        ("/note", "Kazakh"),
+        ("https://example.com/a_b?x=1", "Kazakh"),
+        ("/note осы конспектіні сақта", "Kazakh"),
+        ("/note мне нужен конспект", "Kazakh"),  # Russian -> Kazakh, never Russian
+        ("/summarize https://example.com please summarize this", "English"),
+        ("what is this about? https://youtu.be/x", "English"),
+    ]
+    for text, expected in cases:
+        check(f"{text!r} -> {expected}", reply_language(text) == expected)
+    check(
+        "user_words removes command and URL only",
+        user_words("/download@Bot https://x.y/z hello") == "hello",
+    )
+
+
+async def routing_offline_checks() -> None:
+    """Feed real aiogram Updates through the real root router (no network):
+    `/download <url>` must reach the download handler, not the Phase 2 URL
+    catch-all, and its description prompt must ask for Kazakh."""
+    from datetime import datetime
+
+    from aiogram import Bot, Dispatcher
+    from aiogram.client.session.base import BaseSession
+    from aiogram.types import Chat, Message, Update, User
+
+    import bot.handlers.links as links_handlers
+    import bot.handlers.media as media_handlers
+    from bot.handlers import build_root_router
+    from harness import LinkSummary, MediaDownload
+    from tools.downloader import VideoInfo
+    from tools.urls import classify_url
+
+    chat = Chat(id=1, type="private")
+
+    class RecordingSession(BaseSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list = []
+
+        async def make_request(self, bot, method, timeout=None):
+            self.calls.append(method)
+            if method.__returning__ is User:  # getMe, for "/cmd@BotName" mention checks
+                return User(id=42, is_bot=True, first_name="Harness", username="HarnessBot")
+            if method.__returning__ is Message:
+                return Message(message_id=len(self.calls) + 100, date=datetime.now(), chat=chat)
+            return True
+
+        async def stream_content(self, *args, **kwargs):  # pragma: no cover
+            yield b""
+
+        async def close(self) -> None:
+            pass
+
+    description_llm = CapturingProvider("## Overview\n**Bold** point & <tag>\n- item one")
+
+    class FakeMedia:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, bool]] = []
+
+        async def download(self, url, *, convert_to_mp3, user_message, on_progress=None):
+            self.calls.append((url, user_message, convert_to_mp3))
+            info = VideoInfo(
+                url=url, id="x", title="Some English Title", duration=10.0,
+                uploader=None, is_live=False, extractor="Youtube",
+            )  # fmt: skip
+            description = await media_notes.describe_media(
+                LLMRouter([description_llm]), info, user_message=user_message
+            )
+            return MediaDownload(
+                filename="media.mp3" if convert_to_mp3 else "media.mp4",
+                data=b"fake media bytes",
+                title=info.title,
+                description=description,
+                is_audio=convert_to_mp3,
+                width=1280,
+                height=720,
+                duration=10.0,
+            )
+
+    class FakeHarness:
+        def __init__(self) -> None:
+            self.summarized: list[tuple[str, str]] = []
+
+        def link_kind(self, url):
+            return classify_url(url)
+
+        async def summarize_link(self, *, telegram_id, chat_id, url, user_message, **_):
+            self.summarized.append((url, user_message))
+            return LinkSummary(url, classify_url(url), "Title", "**Summary**", "article")
+
+        async def start_lesson(self, **_):
+            raise AssertionError("tutor must not receive this message")
+
+    class FakeArchive:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        async def search(self, *, telegram_id, query):
+            self.queries.append(query)
+            return None
+
+    session = RecordingSession()
+    fake_bot = Bot(token="42:offline-selfcheck", session=session)
+    media, harness, archive = FakeMedia(), FakeHarness(), FakeArchive()
+    dp = Dispatcher(harness=harness, media=media, archive=archive, settings=None)
+    dp.include_router(build_root_router())
+
+    update_id = 0
+
+    async def send(text: str) -> None:
+        nonlocal update_id
+        update_id += 1
+        message = Message(
+            message_id=update_id,
+            date=datetime.now(),
+            chat=chat,
+            from_user=User(id=1, is_bot=False, first_name="Test"),
+            text=text,
+        )
+        session.calls.clear()
+        await dp.feed_update(fake_bot, Update(update_id=update_id, message=message))
+        pending = media_handlers._background_tasks | links_handlers._background_tasks
+        await asyncio.gather(*pending)
+
+    def sent(name: str) -> list:
+        return [call for call in session.calls if type(call).__name__ == name]
+
+    print("\nRouting (/download must not be swallowed by the Phase 2 URL catch-all):")
+    url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    await send(f"/download {url}")
+    check("'/download <url>' reached the download handler", len(media.calls) == 1)
+    check("... and NOT the link summarizer", harness.summarized == [])
+    check("the downloaded URL is the one sent", media.calls[0][0] == url)
+    check(
+        "description prompt asks for Kazakh",
+        "(Reply language: Kazakh.)" in description_llm.prompts[-1],
+    )
+    videos = sent("SendVideo")
+    check("mp4 sent via send_video", len(videos) == 1 and not sent("SendDocument"))
+    check("... with supports_streaming", videos[0].supports_streaming is True)
+    check("... with dimensions", (videos[0].width, videos[0].height) == (1280, 720))
+    check("caption uses HTML parse mode", videos[0].parse_mode == "HTML")
+    check("caption Markdown converted, not raw", "<b>Bold</b>" in videos[0].caption)
+    check(
+        "caption HTML-escaped",
+        "&amp; &lt;tag&gt;" in videos[0].caption and "##" not in videos[0].caption,
+    )
+
+    await send(f"/download@HarnessBot {url} mp3")
+    check("'/download@Bot <url> mp3' reached the download handler", len(media.calls) == 2)
+    check("... mp3 flag parsed", media.calls[1][2] is True)
+    check(
+        "... 'mp3' option is not counted as English",
+        "(Reply language: Kazakh.)" in description_llm.prompts[-1],
+    )
+    check("... sent as audio", len(sent("SendAudio")) == 1)
+
+    await send(f"/download {url} please describe it")
+    check(
+        "English words after the URL still switch to English",
+        "(Reply language: English.)" in description_llm.prompts[-1],
+    )
+
+    print("\nRouting (other commands with a URL also beat the catch-all):")
+    await send("/find https://example.com/x")
+    check("'/find <url>' reached the document search", archive.queries == ["https://example.com/x"])
+    check("... and NOT the link summarizer", harness.summarized == [])
+
+    await send(f"/summarize {url}")
+    check("'/summarize <url>' still summarizes", len(harness.summarized) == 1)
+
+    await send("https://example.com/article")
+    check("a plain URL still goes to the Phase 2 summarizer", len(harness.summarized) == 2)
+    answers = sent("SendMessage")
+    check(
+        "summary sent as HTML",
+        any(a.parse_mode == "HTML" and "<b>Summary</b>" in a.text for a in answers),
+    )
+    check("/find and plain URLs triggered no download", len(media.calls) == 3)
+
+    await fake_bot.session.close()
+
+
+def formatting_offline_checks() -> None:
+    from bot.formatting import TELEGRAM_CAPTION_LIMIT, _balanced, render_chunks
+
+    print("\nTelegram HTML formatter:")
+    md = (
+        "### Heading\n**bold** and *italic* and `a_b<c>`\n- bullet with [link](https://x.y/a_b)\n"
+        "```python\nif a < b and c & d:\n    pass\n```\n> quoted\n***weird***"
+    )
+    html = render_chunks(md)[0]
+    check("heading -> <b>", "<b>Heading</b>" in html and "###" not in html)
+    check("bold/italic converted", "<b>bold</b>" in html and "<i>italic</i>" in html)
+    check("inline code escaped, not italicised", "<code>a_b&lt;c&gt;</code>" in html)
+    check("bullet rendered", "• bullet" in html)
+    check("link kept intact", '<a href="https://x.y/a_b">link</a>' in html)
+    check(
+        "code block escaped",
+        '<pre><code class="language-python">if a &lt; b and c &amp; d:' in html,
+    )
+    check("quote rendered", "<blockquote>quoted</blockquote>" in html)
+    check("output is balanced HTML", _balanced(html))
+
+    long_md = "\n".join(f"**Point {i}** — " + "detail & more " * 20 for i in range(200))
+    chunks = render_chunks(long_md, header="Title <x>")
+    check("long text split into several chunks", len(chunks) > 1)
+    check("every chunk within Telegram's limit", all(len(c) <= 4096 for c in chunks))
+    check("every chunk balanced on its own", all(_balanced(c) for c in chunks))
+    check("header escaped and bold", chunks[0].startswith("<b>Title &lt;x&gt;</b>"))
+    caption = render_chunks(long_md, limit=TELEGRAM_CAPTION_LIMIT)
+    check("caption chunks within 1024", all(len(c) <= TELEGRAM_CAPTION_LIMIT for c in caption))
+
+    big_code = "```\n" + "x = 1 < 2\n" * 2000 + "```"
+    check(
+        "an oversized code block is split into balanced <pre> chunks",
+        all(len(c) <= 4096 and _balanced(c) for c in render_chunks(big_code)),
+    )
+
+    print("\n/note keeps OCR text verbatim:")
+    ocr_text = "Pronunciation: [See-ee-oh]\n**not bold** # not a heading\n<b>"
+    verbatim = render_chunks(ocr_text, header="📝 Title", verbatim=True)[0]
+    check("bracketed text untouched", "[See-ee-oh]" in verbatim)
+    check("Markdown-looking OCR text left literal", "**not bold** # not a heading" in verbatim)
+    check("but still HTML-escaped", "&lt;b&gt;" in verbatim)
+
+
+def download_format_offline_checks() -> None:
+    """Format selection on a synthetic yt-dlp info dict — no network."""
+    from tools.downloader import estimated_size, select_video_format
+
+    print("\nDownload format selection (mp4 first, size-capped):")
+    mb = 1024 * 1024
+
+    def fmt(format_id, ext, vcodec, acodec, height, size_mb):
+        return {
+            "format_id": format_id, "ext": ext, "vcodec": vcodec, "acodec": acodec,
+            "height": height, "width": height * 16 // 9 if height else None,
+            "filesize": int(size_mb * mb), "url": f"https://example.invalid/{format_id}",
+            "protocol": "https",
+        }  # fmt: skip
+
+    raw = {
+        "_type": "video",
+        "id": "x",
+        "title": "t",
+        "extractor": "youtube",
+        "extractor_key": "Youtube",
+        "webpage_url": "https://www.youtube.com/watch?v=x",
+        "duration": 600,
+        "formats": [
+            fmt("140", "m4a", "none", "mp4a.40.2", None, 5),
+            fmt("251", "webm", "none", "opus", None, 6),
+            fmt("137", "mp4", "avc1.640028", "none", 1080, 80),
+            fmt("248", "webm", "vp9", "none", 1080, 60),
+            fmt("136", "mp4", "avc1.4d401f", "none", 720, 30),
+            fmt("247", "webm", "vp9", "none", 720, 25),
+            fmt("135", "mp4", "avc1.4d401e", "none", 480, 15),
+        ],
+    }
+    opts = {"quiet": True, "no_warnings": True, "merge_output_format": "mp4"}
+    _, selected = select_video_format(raw, opts, 45 * mb)
+    ids = [f["format_id"] for f in selected.get("requested_formats") or [selected]]
+    check("1080p (85 MB) skipped, 720p H.264 + m4a picked", ids == ["136", "140"])
+    check("estimated size under the cap", estimated_size(selected) <= 45 * mb)
+    _, unlimited = select_video_format(raw, opts, None)
+    check(
+        "with no cap the best H.264 wins over VP9",
+        [f["format_id"] for f in unlimited["requested_formats"]] == ["137", "140"],
+    )
+
+
+async def download_check(url: str, *, convert_to_mp3: bool) -> None:
+    """Run the Phase 4 generalized downloader (no Telegram) and print what
+    would be sent — the real-network counterpart of `phase4_offline_checks`."""
+    from config import load_settings
+    from harness.media import MediaError, MediaPipeline
+    from llm_router import build_router
+
+    print(f"\nMedia download: {url} (mp3={convert_to_mp3})")
+    settings = load_settings()
+    router = build_router(settings)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        notes = NoteStore(Path(tmp) / "notes.db")
+        await notes.connect()
+        media = MediaPipeline(
+            router=router,
+            download_dir=settings.download_dir,
+            note_store=notes,
+            ffmpeg_path=settings.ffmpeg_path,
+            tesseract_cmd=settings.tesseract_cmd,
+            ocr_lang=settings.ocr_lang,
+            ocr_tessdata_dir=settings.ocr_tessdata_dir,
+            max_download_mb=settings.media_max_download_mb,
+        )
+        print("  " + media.describe())
+
+        async def progress(text: str) -> None:
+            print(f"  ... {text}")
+
+        try:
+            result = await media.download(
+                url, convert_to_mp3=convert_to_mp3, user_message=url, on_progress=progress
+            )
+        except MediaError as exc:
+            check(f"download failed: {exc}", False)
+        finally:
+            await router.aclose()
+            await notes.close()
+    check("file downloaded", len(result.data) > 0)
+    check("description returned", bool(result.description.strip()))
+    print(f"\n--- {result.filename} ({len(result.data) / 1e6:.1f} MB) ---")
+    print(result.description)
+    print("-------------------")
+
+
+async def screenshot_check(image_path: str) -> None:
+    """Run the Phase 4 screenshot pipeline (real OCR, no Telegram) and print
+    the result — the real-OCR counterpart of `phase4_offline_checks`.
+
+    Wires up a real (temp, throwaway) encrypted DocumentArchive alongside the
+    notes staging store, same as `main.py`, so the PII safety net's redirect
+    path (`document_fields.has_pii_signals`) is exercised for real if the
+    image trips it — not just the offline stub-based check."""
+    from config import load_settings
+    from harness.documents import DocumentArchive
+    from harness.media import MediaError, MediaPipeline
+    from llm_router import build_router
+    from storage.documents import DocumentStore
+
+    print(f"\nScreenshot pipeline: {image_path}")
+    settings = load_settings()
+    router = build_router(settings)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        notes = NoteStore(Path(tmp) / "notes.db")
+        await notes.connect()
+        documents = DocumentStore(
+            db_path=Path(tmp) / "documents.db",
+            scan_dir=Path(tmp) / "scans",
+            encryption_key=settings.documents_encryption_key,
+        )
+        await documents.connect()
+        archive = DocumentArchive(
+            store=documents,
+            tesseract_cmd=settings.tesseract_cmd,
+            ocr_lang=settings.ocr_lang,
+            ocr_tessdata_dir=settings.ocr_tessdata_dir,
+        )
+        media = MediaPipeline(
+            router=router,
+            download_dir=settings.download_dir,
+            note_store=notes,
+            tesseract_cmd=settings.tesseract_cmd,
+            ocr_lang=settings.ocr_lang,
+            ocr_tessdata_dir=settings.ocr_tessdata_dir,
+            document_archive=archive,
+        )
+        print("  " + media.describe())
+        image_bytes = Path(image_path).read_bytes()
+        try:
+            result = await media.capture_screenshot(
+                telegram_id=0, image_bytes=image_bytes, user_message=""
+            )
+
+            if result.redirected_to_documents:
+                assert result.document is not None
+                check("redirected to the encrypted document archive, not notes", True)
+                check(
+                    "nothing landed in the unencrypted notes table",
+                    await notes.count(telegram_id=0) == 0,
+                )
+                print(f"\n--- redirected: document_type={result.document.document_type} ---")
+                print(result.document.fields)
+                print("-------------------")
+            else:
+                assert result.note is not None
+                check("note saved", result.note.id > 0)
+                print(f"\n--- {result.note.title} (tags: {result.note.tags}) ---")
+                print(result.note.content_md)
+                print("-------------------")
+        except MediaError as exc:
+            check(f"screenshot pipeline failed: {exc}", False)
+        finally:
+            await router.aclose()
+            await notes.close()
+            await documents.close()
+
+
 async def link_check(url: str) -> None:
     """Run the full Phase 2 pipeline (no Telegram) and print the summary."""
     from config import load_settings
@@ -373,10 +891,31 @@ async def main() -> None:
         await link_check(sys.argv[index + 1])
         print("\nLink check passed.")
         return
+    if "--download" in sys.argv:
+        index = sys.argv.index("--download")
+        if index + 1 >= len(sys.argv):
+            raise SystemExit("usage: selfcheck.py --download <url> [mp3]")
+        convert_to_mp3 = "mp3" in sys.argv[index + 2 :]
+        await download_check(sys.argv[index + 1], convert_to_mp3=convert_to_mp3)
+        print("\nDownload check passed.")
+        return
+    if "--screenshot" in sys.argv:
+        index = sys.argv.index("--screenshot")
+        if index + 1 >= len(sys.argv):
+            raise SystemExit("usage: selfcheck.py --screenshot <image_path>")
+        await screenshot_check(sys.argv[index + 1])
+        print("\nScreenshot check passed.")
+        return
     await offline_checks()
     phase2_offline_checks()
     phase3_offline_checks()
     await document_store_offline_check()
+    await phase4_offline_checks()
+    await note_store_offline_check()
+    language_offline_checks()
+    await routing_offline_checks()
+    formatting_offline_checks()
+    download_format_offline_checks()
     if "--live" in sys.argv:
         await live_check()
     print("\nAll checks passed.")

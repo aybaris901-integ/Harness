@@ -2,7 +2,8 @@
 
 Agent harness over free-tier LLMs. See `CLAUDE.md` for the full spec and roadmap.
 
-**Current status: Phase 3** — tutor + link/video summarizer + document archive.
+**Current status: Phase 4** — tutor + link/video summarizer + document archive +
+generalized media downloader + screenshot notes.
 
 ## Layout
 
@@ -15,25 +16,30 @@ harness/
   orchestrator.py    the harness: the only thing that talks to bot + LLM + storage
   links.py           Phase 2 route: article vs video, subtitles vs STT, progress
   documents.py       Phase 3 route: OCR -> field extraction -> encrypted storage -> search
-  prompts.py         system prompts, verbatim from CLAUDE.md §9
+  media.py           Phase 4 route: any-URL download/convert + screenshot OCR -> note staging
+  prompts.py         system prompts, verbatim from CLAUDE.md §9 (+ Phase 4's own, see file)
 strings.py           every static, non-LLM user-facing string (CLAUDE.md §8) — Kazakh
 bot/
   __init__.py        Bot/Dispatcher construction
   handlers/          Telegram handlers — translate events into Harness calls
     links.py         URL messages + /summarize; video jobs run in the background
     documents.py     photo uploads + /find; document archive only
+    media.py         /download (background job) + photos captioned /note
   middlewares.py     whitelist gate + user tracking
   states.py          FSM states
 storage/
   db.py              plain SQLite: users + chat history
   documents.py        SEPARATE encrypted SQLite: document fields/OCR text + scan references
+  notes.py           plain SQLite staging table for Phase 4 screenshot notes — no search yet
 tools/               standalone pipelines, no bot/harness imports
   urls.py            URL detection + article/video classification
   article.py         httpx fetch -> trafilatura extraction
-  downloader.py      yt-dlp: probe, subtitles, audio
+  downloader.py      yt-dlp: probe, subtitles, audio, and (Phase 4) any-file download/mp3
   transcript.py      VTT parsing, [mm:ss] transcript rendering
   transcriber.py     speech-to-text: Groq Whisper -> local faster-whisper
-  summarizer.py      builds the §9 prompts and calls llm_router
+  summarizer.py      builds the §9 prompts and calls llm_router (Phase 2)
+  media_notes.py     Phase 4: media description + screenshot title/tags via llm_router
+  language.py        reply-language decision (command word + URLs stripped first)
   ocr.py             local Tesseract OCR — never a cloud vision API (CLAUDE.md §5)
   document_fields.py regex/heuristic field extraction + search-query scoring
 scripts/selfcheck.py local sanity check, no Telegram needed
@@ -136,6 +142,19 @@ is an optional fallback for documents where regex genuinely finds nothing
 (neither a recognized document type nor any field); it talks to a local
 Ollama-compatible server directly, never `llm_router.py`, and stays off by default.
 
+### Phase 4 extras (media pipeline) — no new required config
+
+Reuses Phase 2's `ffmpeg`/yt-dlp setup (for `/download`) and Phase 3's Tesseract
+setup (for `/note` screenshots) as-is — nothing new to install if you already
+did those. Two optional settings, both with working defaults:
+
+- `NOTES_DB_PATH` (default `data/notes.db`) — plain SQLite staging table for
+  screenshot notes; not encrypted (screenshots are the explicit non-sensitive
+  case, CLAUDE.md §5), not searchable yet (Phase 5's vector store will index
+  it later).
+- `MEDIA_MAX_DOWNLOAD_MB` (default `45`) — `/download` refuses anything over
+  this; Telegram bot uploads cap at ~50 MB.
+
 ## Run
 
 ```powershell
@@ -192,6 +211,24 @@ asyncio.run(main())
 "
 ```
 
+**Phase 4 generalized downloader**, no Telegram (runs the real yt-dlp fetch +
+LLM description and prints it; add `mp3` to also exercise the ffmpeg conversion):
+
+```powershell
+.\.venv\Scripts\python.exe scripts\selfcheck.py --download https://www.youtube.com/watch?v=jNQXAC9IVRw
+.\.venv\Scripts\python.exe scripts\selfcheck.py --download https://www.youtube.com/watch?v=jNQXAC9IVRw mp3
+```
+
+**Phase 4 screenshot pipeline**, no Telegram (runs real OCR + the LLM
+formatting call on a local image and prints the resulting note). The JSON
+parsing itself (valid/invalid/empty replies) is covered offline, without OCR
+or a real LLM call, by the default `scripts\selfcheck.py` run above (see
+"Screenshot note formatting" in its output):
+
+```powershell
+.\.venv\Scripts\python.exe scripts\selfcheck.py --screenshot path\to\screenshot.png
+```
+
 **In Telegram**, after `python main.py`:
 
 | You send | Expected |
@@ -211,6 +248,10 @@ asyncio.run(main())
 | a photo of a document (passport, vehicle registration, contract, receipt) | "⏳ Құжатты өңдеп жатырмын…" then ✅ with the detected document type + extracted fields |
 | `/find <query>` (e.g. `/find көлік нөмірі`) | best-matching stored document's fields, then the original scan photo |
 | `/find` with no match | "no matching document" reply |
+| `/download <url>` | "⏳ processing…" placeholder, then an inline-playable mp4 video (H.264/AAC, highest resolution under `MEDIA_MAX_DOWNLOAD_MB`) with a Kazakh LLM description as the caption |
+| `/download <url> mp3` | same, but audio-only, converted to mp3 (needs ffmpeg) |
+| a photo captioned `/note` | "⏳ processing…" placeholder, then 📝 bold title, #tags, and the OCR'd text verbatim (the LLM only writes title + tags) |
+| `/note` with no photo | usage reminder: caption a photo with `/note` |
 | a voice message or a non-image file | "text, links and document photos only" |
 
 Replies follow the CLAUDE.md language policy: Kazakh by default, English if
@@ -221,9 +262,13 @@ Telegram command menu) via `strings.py`, not just LLM output (CLAUDE.md §8).
 
 ## Notes / known limits
 
-- **Replies are plain text.** Model output often contains Markdown (`**bold**`),
-  which will show literally. Sending it raw is deliberate: Telegram's MarkdownV2
-  parser rejects unescaped `_ * [ ] ( )` and would make the send fail outright.
+- **Summaries, `/download` descriptions and `/note` are sent as Telegram HTML**
+  (`bot/formatting.py`): model Markdown is converted and escaped there, never
+  MarkdownV2, whose parser rejects unescaped `_ * [ ] ( )` and fails the send.
+  If Telegram still rejects a chunk, it is resent as plain text. Tutor replies
+  are still plain text.
+- **Reply language** is decided by `tools/language.py`: the leading bot command
+  and URLs are stripped first, so `/download <url>` defaults to Kazakh.
 - **FSM state is in memory**, so a restart drops the "am I mid-lesson" flag. The
   conversation itself is in SQLite and is reloaded on the next message, so the
   tutor picks up where it left off.
@@ -274,3 +319,27 @@ Telegram command menu) via `strings.py`, not just LLM output (CLAUDE.md §8).
   keeps PII values from ever being sent anywhere to answer a search.
 - `data/documents.db` and `data/document_scans/` are gitignored along with
   everything else under `data/`.
+
+### Phase 4: media pipeline extras
+
+- **`/download` is deliberately separate from `/summarize`.** `/summarize`
+  only treats the hardcoded hosts in `tools/urls.py` (`_VIDEO_HOSTS`) as
+  video, everything else as an article to read; `/download` doesn't do that
+  classification at all — it just asks yt-dlp to fetch whatever's at the URL,
+  so it also works on hosts `/summarize` would have treated as an article.
+- **The description is metadata-based, not a transcript summary.** Unlike
+  `/summarize`'s video path, `/download` doesn't fetch subtitles or run STT —
+  it asks the LLM to describe the file from its title/uploader/description/
+  chapters alone. If you want an actual transcript summary, use `/summarize`.
+- **A download is read fully into memory** before being sent to Telegram
+  (not streamed from disk), so `MEDIA_MAX_DOWNLOAD_MB` is a hard cap, checked
+  after the file lands and before it's ever handed to the LLM or Telegram.
+- **`/note` vs. a plain document photo:** `bot/handlers/media.py`'s router is
+  included *before* `bot/handlers/documents.py`'s in `bot/handlers/__init__.py`
+  specifically so a `/note`-captioned photo is claimed first; any other photo
+  still goes to the Phase 3 PII pipeline unchanged — default photo behavior
+  did not change.
+- **The staging table has no search on purpose** (CLAUDE.md §7 Phase 4) —
+  `storage/notes.py` only saves and counts. Phase 5's vector store is meant to
+  migrate from `content_json` in that table once it exists; nothing here
+  should grow ad-hoc search before then.

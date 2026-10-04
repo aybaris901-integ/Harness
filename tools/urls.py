@@ -64,6 +64,12 @@ def extract_urls(text: str | None) -> list[str]:
     return found
 
 
+def strip_urls(text: str) -> str:
+    """`text` with every URL replaced by a space. Matches the raw pattern, not
+    `extract_urls`' normalized output, so a scheme-less `www.` link is removed too."""
+    return _URL_RE.sub(" ", text)
+
+
 def _host(url: str) -> str:
     host = (urlsplit(url).hostname or "").lower()
     return host[4:] if host.startswith("www.") else host

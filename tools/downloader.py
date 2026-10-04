@@ -1,10 +1,12 @@
 """Video pipeline, step 1: yt-dlp.
 
-Two entry points, both blocking-in-a-thread wrappers around yt-dlp:
+Blocking-in-a-thread wrappers around yt-dlp:
 
 - `probe(url)`            -> `VideoInfo` (title, duration, which subtitles exist)
 - `fetch_subtitles(...)`  -> transcript segments from existing subs, if any
-- `fetch_audio(...)`      -> path to an audio file for speech-to-text
+- `fetch_audio(...)`      -> path to a small audio file for speech-to-text (Phase 2)
+- `fetch_media(...)`      -> a Telegram-playable mp4 (largest resolution under
+                              the size cap) or an mp3, to hand back to the user (Phase 4)
 
 The subtitle path is preferred (CLAUDE.md §3): free, instant, and usually more
 accurate than STT. Audio is only downloaded when there are no usable subs.
@@ -13,6 +15,7 @@ accurate than STT. Audio is only downloaded when there are no usable subs.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import shutil
 from dataclasses import dataclass, field
@@ -20,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import yt_dlp
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import DownloadError, ExtractorError
 
 from tools.transcript import Segment, parse_vtt
 
@@ -259,6 +262,161 @@ async def fetch_audio(
     path = await asyncio.to_thread(_fetch_audio_sync, url, work_dir, ffmpeg_path, max_bytes)
     logger.info("audio for %s: %s (%.1f MB)", url, path.name, path.stat().st_size / 1e6)
     return path
+
+
+# Telegram plays a video inline only as mp4 with H.264 video + AAC audio; a
+# VP9/AV1 webm (what "bestvideo+bestaudio" picks on YouTube) arrives as a file
+# to download instead. So: H.264 + m4a merged into mp4 first, then a single-
+# file mp4, and only then whatever is best (still remuxed into an mp4
+# container via merge_output_format — playable on most clients, and the bot
+# layer falls back to sending a document if Telegram rejects it as a video).
+# Bare "best" alone no longer matches anything on YouTube, which serves
+# separate DASH video/audio streams only.
+_VIDEO_FORMAT = "bv*[vcodec^=avc1]{h}+ba[ext=m4a]/b[ext=mp4]{h}/bv*{h}+ba/b{h}"
+# Tried in order until the estimated size fits the cap — a lower resolution
+# beats failing with "file too large".
+_HEIGHT_LADDER: tuple[int | None, ...] = (None, 1080, 720, 480, 360, 240, 144)
+
+
+@dataclass(slots=True)
+class FetchedMedia:
+    path: Path
+    width: int | None = None
+    height: int | None = None
+    duration: float | None = None
+
+
+def video_format_selector(max_height: int | None) -> str:
+    return _VIDEO_FORMAT.format(h=f"[height<={max_height}]" if max_height else "")
+
+
+def estimated_size(selected: dict[str, Any]) -> int | None:
+    """Bytes the selected format(s) will take, or None if any part is unknown."""
+    total = 0
+    for part in selected.get("requested_formats") or [selected]:
+        size = part.get("filesize") or part.get("filesize_approx")
+        if not size:
+            return None
+        total += int(size)
+    return total
+
+
+def select_video_format(
+    raw_info: dict[str, Any], opts: dict[str, Any], max_bytes: int | None
+) -> tuple[str, dict[str, Any]]:
+    """Walk `_HEIGHT_LADDER` and return the first selector (plus yt-dlp's
+    resolved selection) whose estimated size fits `max_bytes`. Pure format
+    selection on an already-extracted info dict — no network."""
+    last: tuple[str, dict[str, Any]] | None = None
+    for max_height in _HEIGHT_LADDER:
+        selector = video_format_selector(max_height)
+        try:
+            with yt_dlp.YoutubeDL(opts | {"format": selector}) as ydl:
+                selected = ydl.process_ie_result(copy.deepcopy(raw_info), download=False)
+        except (DownloadError, ExtractorError):
+            continue  # nothing at this height (or at all) — try the next rung
+        if selected is None:
+            continue
+        last = (selector, selected)
+        size = estimated_size(selected)
+        # Unknown size: can't do better than trying it; max_filesize and the
+        # harness' post-download check still guard the cap.
+        if not max_bytes or size is None or size <= max_bytes:
+            return selector, selected
+        logger.info(
+            "format %s ~%.1f MB exceeds the %.1f MB cap, trying a lower resolution",
+            selected.get("format_id"),
+            size / 1e6,
+            max_bytes / 1e6,
+        )
+    if last is None:
+        raise NotAVideo("no downloadable video format found")
+    raise DownloadFailed(
+        f"even the lowest resolution is larger than {max_bytes / 1e6:.0f} MB"
+        if max_bytes
+        else "no downloadable video format found"
+    )
+
+
+def _fetch_media_sync(
+    url: str,
+    work_dir: Path,
+    ffmpeg_path: str | None,
+    convert_to_mp3: bool,
+    max_bytes: int | None,
+) -> FetchedMedia:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    opts = _base_opts(ffmpeg_path) | {"outtmpl": str(work_dir / "media.%(ext)s")}
+    if max_bytes:
+        # Best-effort pre-check per stream; select_video_format below is what
+        # actually keeps the merged total under the cap.
+        opts["max_filesize"] = max_bytes
+
+    selected: dict[str, Any] = {}
+    try:
+        if convert_to_mp3:
+            # An audio-only stream exists standalone, so "bestaudio" matches
+            # directly. Requires ffmpeg; a missing one surfaces as a
+            # DownloadError through _translate_error's generic case.
+            opts["format"] = "bestaudio/best"
+            opts["postprocessors"] = [
+                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+            ]
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        else:
+            # Extract once, pick a format that fits offline, download that one.
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                raw_info = ydl.extract_info(url, download=False, process=False)
+            if raw_info is None:
+                raise NotAVideo(f"no video found at {url}")
+            opts["merge_output_format"] = "mp4"
+            selector, selected = select_video_format(raw_info, opts, max_bytes)
+            logger.info(
+                "media for %s: format %s (%sp, ~%s MB)",
+                url,
+                selected.get("format_id"),
+                selected.get("height") or "?",
+                f"{size / 1e6:.1f}" if (size := estimated_size(selected)) else "?",
+            )
+            with yt_dlp.YoutubeDL(opts | {"format": selector}) as ydl:
+                ydl.process_ie_result(raw_info, download=True)
+    except DownloadError as exc:
+        raise _translate_error(exc, url) from exc
+    except ExtractorError as exc:
+        raise DownloadFailed(f"yt-dlp failed: {str(exc).splitlines()[-1][:200]}") from exc
+
+    files = [p for p in work_dir.glob("media.*") if p.suffix not in {".part", ".ytdl"}]
+    if not files:
+        raise DownloadFailed("download produced no file (over the size limit, or no media stream?)")
+    # Prefer the merged mp4 if a stray intermediate stream file is left over.
+    files.sort(key=lambda p: p.suffix != ".mp4")
+    duration = selected.get("duration")
+    return FetchedMedia(
+        path=files[0],
+        width=selected.get("width"),
+        height=selected.get("height"),
+        duration=float(duration) if duration else None,
+    )
+
+
+async def fetch_media(
+    url: str,
+    work_dir: Path,
+    *,
+    ffmpeg_path: str | None = None,
+    convert_to_mp3: bool = False,
+    max_bytes: int | None = None,
+) -> FetchedMedia:
+    """Download any yt-dlp-supported URL (CLAUDE.md §7 Phase 4) — unlike
+    `fetch_audio`, this is for "save the file", not speech-to-text input: video
+    comes back as a Telegram-playable mp4 at the highest resolution that fits
+    `max_bytes`, or as mp3 when `convert_to_mp3` is set."""
+    media = await asyncio.to_thread(
+        _fetch_media_sync, url, work_dir, ffmpeg_path, convert_to_mp3, max_bytes
+    )
+    logger.info("media for %s: %s (%.1f MB)", url, media.path.name, media.path.stat().st_size / 1e6)
+    return media
 
 
 def cleanup(work_dir: Path) -> None:

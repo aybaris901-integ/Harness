@@ -443,6 +443,42 @@ def needs_local_llm_fallback(extracted: ExtractedDocument) -> bool:
     return extracted.document_type == "unknown" and not extracted.fields
 
 
+# -- PII safety net for non-PII pipelines (CLAUDE.md §5) ----------------------
+
+# Identity/ownership document types only — deliberately narrower than all of
+# DOCUMENT_TYPE_KEYWORDS. "contract"/"receipt" are not personal documents and
+# are not gated here; harness/media.py's /note path only needs to keep an
+# actual passport/vehicle-registration photo out of the unencrypted notes
+# staging table.
+_PII_DOCUMENT_TYPES = ("passport", "vehicle_registration")
+
+
+def has_pii_signals(text: str) -> bool:
+    """True if `text` shows any signal `extract_fields` also uses to recognize
+    a passport or vehicle-registration document: an MRZ block, an IIN, a VIN,
+    or an identity/vehicle-document keyword (e.g. "паспорт", "жеке куәлік",
+    "техпаспорт" and their inflected forms — see `_keyword_regex`) anywhere in
+    the text.
+
+    Deliberately more permissive than `detect_document_type`: that function
+    only counts a keyword hit in the title region or on a short label-like
+    line, to avoid misclassifying a document that merely *references* another
+    document type (CLAUDE.md §7 Phase 3 bug fix). A safety net has the
+    opposite bias — it should over-flag, not under-flag — so every keyword
+    occurrence counts here, position notwithstanding.
+    """
+    if _extract_mrz(text)[1] is not None:
+        return True
+    if _IIN_RE.search(text) or _VIN_RE.search(text):
+        return True
+    lowered = text.lower()
+    return any(
+        pattern.search(lowered)
+        for doc_type in _PII_DOCUMENT_TYPES
+        for pattern in _DOCUMENT_TYPE_PATTERNS[doc_type]
+    )
+
+
 # -- optional local-LLM fallback (never llm_router.py, never cloud) ----------
 
 _LOCAL_LLM_PROMPT = """The text below is raw OCR output from a personal document (passport, vehicle registration, contract, receipt, etc). OCR errors are possible.

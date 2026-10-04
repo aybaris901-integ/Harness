@@ -15,12 +15,13 @@ import strings
 from bot.handlers import build_root_router
 from bot.middlewares import AccessMiddleware, UserTrackingMiddleware
 from config import Settings
-from harness import DocumentArchive, Harness
+from harness import DocumentArchive, Harness, MediaPipeline
 from storage import Storage
 
 BOT_COMMANDS = [
     BotCommand(command="tutor", description=strings.CMD_TUTOR_DESC),
     BotCommand(command="summarize", description=strings.CMD_SUMMARIZE_DESC),
+    BotCommand(command="download", description=strings.CMD_DOWNLOAD_DESC),
     BotCommand(command="find", description=strings.CMD_FIND_DESC),
     BotCommand(command="reset", description=strings.CMD_RESET_DESC),
     BotCommand(command="cancel", description=strings.CMD_CANCEL_DESC),
@@ -29,18 +30,28 @@ BOT_COMMANDS = [
 
 
 def create_bot(settings: Settings) -> Bot:
-    # parse_mode=None: model output is sent verbatim as plain text, so stray
-    # Markdown characters can never make a send fail.
+    # parse_mode=None by default: static strings and errors go out as plain
+    # text. Model/note content opts into HTML per call via bot/formatting.py,
+    # which escapes it and falls back to plain text if Telegram rejects it.
     return Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=None))
 
 
 def create_dispatcher(
-    *, settings: Settings, orchestrator: Harness, storage: Storage, archive: DocumentArchive
+    *,
+    settings: Settings,
+    orchestrator: Harness,
+    storage: Storage,
+    archive: DocumentArchive,
+    media: MediaPipeline,
 ) -> Dispatcher:
     # MemoryStorage: FSM position resets on restart, which is fine — the actual
     # conversation lives in SQLite and is reloaded on the next turn.
     dp = Dispatcher(
-        storage=MemoryStorage(), harness=orchestrator, settings=settings, archive=archive
+        storage=MemoryStorage(),
+        harness=orchestrator,
+        settings=settings,
+        archive=archive,
+        media=media,
     )
 
     dp.message.outer_middleware(AccessMiddleware(settings))

@@ -8,14 +8,13 @@ else (fetching, extraction, transcription) happens upstream in the other
 from __future__ import annotations
 
 import logging
-import re
 
 from harness.prompts import ARTICLE_SUMMARIZER_SYSTEM_PROMPT, VIDEO_SUMMARIZER_SYSTEM_PROMPT
 from llm_router import LLMRouter
 from tools.article import Article
 from tools.downloader import VideoInfo
+from tools.language import reply_language
 from tools.transcript import format_timestamp
-from tools.urls import extract_urls
 
 logger = logging.getLogger(__name__)
 
@@ -28,25 +27,10 @@ SUMMARY_TEMPERATURE = 0.3
 # LANGUAGE_POLICY alone is not enough here: with an English source and a bare
 # URL as the user turn, models drift to English. So the reply language is
 # decided in code from the user's own words (CLAUDE.md §8: explicit routing
-# over "let the model decide") and stated once more at the very end of the
-# prompt, where it carries the most weight.
+# over "let the model decide"; see tools/language.py) and stated once more at
+# the very end of the prompt, where it carries the most weight.
 _REPLY_LANGUAGE_LINE = "\n\n(Reply language: {language}.)"
-_LATIN_WORD_RE = re.compile(r"[A-Za-z]{2,}")
-_CYRILLIC_RE = re.compile(r"[Ѐ-ӿ]")
 _TRUNCATION_NOTE = "\n\n[... text truncated here, the source continues ...]"
-
-
-def reply_language(user_message: str) -> str:
-    """Apply LANGUAGE_POLICY deterministically: English only if the user's own
-    words (ignoring the link itself) are English; anything else -> Kazakh."""
-    words = user_message
-    for url in extract_urls(user_message):
-        words = words.replace(url, " ")
-    if _CYRILLIC_RE.search(words):
-        return "Kazakh"
-    if _LATIN_WORD_RE.search(words):
-        return "English"
-    return "Kazakh"
 
 
 def user_turn(user_message: str) -> str:
