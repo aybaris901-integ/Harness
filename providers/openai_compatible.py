@@ -123,7 +123,40 @@ class OpenAICompatibleProvider(LLMProvider):
             raise ProviderUnavailable(self.name, f"request failed: {exc}") from exc
 
         self._raise_for_status(response)
-        return self._extract_text(response.json())
+        data = response.json()
+        text = self._extract_text(data)
+        if (
+            json_schema is not None
+            and (data.get("choices") or [{}])[0].get("finish_reason") == "length"
+        ):
+            # Structured output cut at max_tokens may still parse (Groq closes
+            # the JSON), silently returning a shorter list — e.g. 6 of 15
+            # flashcards. Treat it as a failure so the router tries the next
+            # provider instead of storing an incomplete result.
+            raise ProviderError(
+                self.name, "structured output truncated at max_tokens (finish_reason=length)"
+            )
+        return text
+
+    def _raise_for_status(self, response: httpx.Response) -> None:
+        # Groq validates structured output server-side and answers a 400 when
+        # one sampled generation doesn't fit the schema ("json_validate_failed",
+        # seen ~1 in 7 flashcard calls at reasoning_effort=low). That is a bad
+        # sample, not a bad request: classify it as transient so the router
+        # retries this provider once before falling through.
+        if response.status_code == 400 and any(
+            marker in response.text
+            for marker in (
+                "json_validate_failed",
+                "does not match the expected schema",
+                "Failed to validate JSON",
+                "Failed to generate JSON",
+            )
+        ):
+            raise ProviderUnavailable(
+                self.name, f"structured output failed validation: {response.text[:300]}"
+            )
+        super()._raise_for_status(response)
 
     def _extract_text(self, data: dict[str, Any]) -> str:
         # OpenRouter reports upstream failures as a 200 with an `error` object.

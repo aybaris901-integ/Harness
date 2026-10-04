@@ -14,6 +14,8 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
+from tools.quiz_clock import parse_quiz_time, parse_utc_offset
+
 BASE_DIR = Path(__file__).resolve().parent
 
 load_dotenv(BASE_DIR / ".env")
@@ -143,6 +145,13 @@ class Settings:
     gemini_vision_model: str
     groq_vision_model: str
     openrouter_vision_model: str
+    # --- Phase 5b: flashcards + spaced repetition ---
+    flashcards_db_path: Path
+    quiz_default_time: str
+    quiz_utc_offset_minutes: int
+    quiz_daily_cap: int
+    cards_max_sources_per_run: int
+    pdf_max_mb: float
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -196,6 +205,26 @@ class Settings:
                 f"VISION_PROVIDER_CHAIN contains unknown providers: "
                 f"{', '.join(sorted(unknown_vision))}. Known: gemini, groq, openrouter."
             )
+        flashcards_db_path = Path(
+            _get("FLASHCARDS_DB_PATH", "data/flashcards.db") or "data/flashcards.db"
+        )
+        if not flashcards_db_path.is_absolute():
+            flashcards_db_path = BASE_DIR / flashcards_db_path
+
+        raw_quiz_time = _get("QUIZ_DEFAULT_TIME", "20:00") or "20:00"
+        quiz_default_time = parse_quiz_time(raw_quiz_time)
+        if quiz_default_time is None:
+            raise ConfigError(f"QUIZ_DEFAULT_TIME must be HH:MM, got {raw_quiz_time!r}")
+        # Default Almaty: Kazakhstan has been on a single UTC+5 zone, no DST,
+        # since 2024 — a fixed offset needs no tz database (Termux-friendly).
+        raw_offset = _get("QUIZ_UTC_OFFSET", "+05:00") or "+05:00"
+        quiz_utc_offset_minutes = parse_utc_offset(raw_offset)
+        if quiz_utc_offset_minutes is None:
+            raise ConfigError(f"QUIZ_UTC_OFFSET must look like +05:00, got {raw_offset!r}")
+        quiz_daily_cap = _get_int("QUIZ_DAILY_CAP", 10)
+        if not 1 <= quiz_daily_cap <= 50:
+            raise ConfigError(f"QUIZ_DAILY_CAP must be 1..50, got {quiz_daily_cap}")
+
         rag_min_score = _get_float("RAG_MIN_SCORE", 0.65)
         if not 0.0 < rag_min_score < 1.0:
             raise ConfigError(f"RAG_MIN_SCORE must be between 0 and 1, got {rag_min_score}")
@@ -299,6 +328,13 @@ class Settings:
             openrouter_vision_model=(
                 _get("OPENROUTER_VISION_MODEL", "qwen/qwen3.8-27b:free") or "qwen/qwen3.8-27b:free"
             ),
+            flashcards_db_path=flashcards_db_path,
+            quiz_default_time=quiz_default_time,
+            quiz_utc_offset_minutes=quiz_utc_offset_minutes,
+            quiz_daily_cap=quiz_daily_cap,
+            cards_max_sources_per_run=_get_int("CARDS_MAX_SOURCES_PER_RUN", 5),
+            # Telegram bots can download files up to 20 MB.
+            pdf_max_mb=_get_float("PDF_MAX_MB", 20.0),
         )
 
         known = set(settings._providers_by_name())

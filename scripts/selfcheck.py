@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cryptography.fernet import Fernet  # noqa: E402
 
+import strings  # noqa: E402
 from harness import Harness  # noqa: E402
 from harness.prompts import TUTOR_SYSTEM_PROMPT  # noqa: E402
 from llm_router import AllProvidersFailedError, LLMRouter  # noqa: E402
@@ -570,13 +571,12 @@ async def routing_offline_checks() -> None:
     catch-all, and its description prompt must ask for Kazakh."""
     from datetime import datetime
 
-    from aiogram import Bot, Dispatcher
+    from aiogram import Bot
     from aiogram.client.session.base import BaseSession
     from aiogram.types import Chat, Message, Update, User
 
     import bot.handlers.links as links_handlers
     import bot.handlers.media as media_handlers
-    from bot.handlers import build_root_router
     from harness import LinkSummary, MediaDownload
     from tools.downloader import VideoInfo
     from tools.urls import classify_url
@@ -671,10 +671,15 @@ async def routing_offline_checks() -> None:
 
     media, harness, archive = FakeMedia(), FakeHarness(), FakeArchive()
     knowledge = FakeKnowledge()
-    dp = Dispatcher(
-        harness=harness, media=media, archive=archive, knowledge=knowledge, settings=None
-    )
-    dp.include_router(build_root_router())
+    dp = shared_dispatcher()
+    services = {
+        "harness": harness,
+        "media": media,
+        "archive": archive,
+        "knowledge": knowledge,
+        "flashcards": None,
+        "settings": None,
+    }
 
     update_id = 0
 
@@ -689,7 +694,7 @@ async def routing_offline_checks() -> None:
             text=text,
         )
         session.calls.clear()
-        await dp.feed_update(fake_bot, Update(update_id=update_id, message=message))
+        await dp.feed_update(fake_bot, Update(update_id=update_id, message=message), **services)
         pending = media_handlers._background_tasks | links_handlers._background_tasks
         await asyncio.gather(*pending)
 
@@ -901,6 +906,24 @@ def download_format_offline_checks() -> None:
     )
 
 
+_SHARED_DP = None
+
+
+def shared_dispatcher():
+    """One Dispatcher holding the full root router for every routing check:
+    aiogram lets a router be attached to a single parent only. Each check
+    passes its own services as feed_update() keyword data."""
+    global _SHARED_DP
+    if _SHARED_DP is None:
+        from aiogram import Dispatcher
+
+        from bot.handlers import build_root_router
+
+        _SHARED_DP = Dispatcher()
+        _SHARED_DP.include_router(build_root_router())
+    return _SHARED_DP
+
+
 class HashEmbedder:
     """Deterministic offline stand-in for llm_router.Embedder: hashed
     bag-of-words, L2-normalized. Same words -> high cosine; disjoint -> ~0."""
@@ -933,7 +956,11 @@ class HashEmbedder:
 
 
 class CountingProvider(LLMProvider):
-    """Counts calls and records prompts; replies with a fixed string."""
+    """Counts calls and records everything sent; replies with a fixed string.
+
+    `prompts` holds system prompt + user turn per call, so "text X was never
+    sent" checks see the whole request — source text lives in the system
+    prompt, not the user turn."""
 
     def __init__(self, name: str, reply: str) -> None:
         super().__init__(api_key="stub", model="stub")
@@ -943,9 +970,9 @@ class CountingProvider(LLMProvider):
         self.prompts: list[str] = []
         self.images_seen = 0
 
-    async def complete(self, *, prompt: str, images=None, **_kwargs) -> str:
+    async def complete(self, *, prompt: str, system=None, images=None, **_kwargs) -> str:
         self.calls += 1
-        self.prompts.append(prompt)
+        self.prompts.append(f"{system or ''}\n\n{prompt}")
         self.images_seen += len(images or [])
         return self.reply
 
@@ -1491,6 +1518,974 @@ async def ask_outcome_logging_checks() -> None:
             kb_logger.setLevel(previous_level)
 
 
+# -- Phase 5b: flashcards, SM-2, daily quiz ---------------------------------------
+
+
+async def _first_turn(flashcard_tools) -> str:
+    """The user turn of a Kazakh-target generation call (for prompt checks)."""
+    stub = CountingProvider(
+        "first-turn", json.dumps({"cards": [{"front": "Сұрақ?", "back": "Жауап"}]})
+    )
+    await flashcard_tools.generate_cards(LLMRouter([stub]), "text", user_message="")
+    return stub.prompts[0]
+
+
+def tiny_text_pdf(lines: list[str]) -> bytes:
+    """A minimal valid one-page PDF with a real text layer (ASCII, Helvetica),
+    built by hand so the checks need no PDF-writing dependency."""
+    escaped = [line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)") for line in lines]
+    ops = "BT /F1 12 Tf 50 750 Td 14 TL " + " ".join(f"({line}) '" for line in escaped) + " ET"
+    stream = ops.encode("latin-1")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    out += b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets)
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    )
+    return bytes(out)
+
+
+def blank_pdf(pages: int) -> bytes:
+    """A 'scanned-like' PDF: pages with no text layer at all."""
+    from io import BytesIO
+
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(width=612, height=792)
+    buffer = BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def sm2_and_clock_checks() -> None:
+    from datetime import datetime
+
+    from tools import quiz_clock, sm2
+
+    print("\nSM-2:")
+    state = sm2.CardState()
+    s1 = sm2.review(state, 4)
+    check("1st success -> interval 1, reps 1", (s1.interval_days, s1.repetitions) == (1, 1))
+    check("grade 4 keeps EF at 2.5", abs(s1.ease - 2.5) < 1e-9)
+    s2 = sm2.review(s1, 4)
+    check("2nd success -> interval 6", s2.interval_days == 6)
+    s3 = sm2.review(s2, 4)
+    check("3rd success -> round(6 * EF 2.5) = 15", s3.interval_days == 15)
+    s3_easy = sm2.review(s2, 5)
+    check("grade 5 raises EF by 0.1", abs(s3_easy.ease - 2.6) < 1e-9)
+    check("... interval still uses the EF from before the review (15)", s3_easy.interval_days == 15)
+    s3_hard = sm2.review(s2, 3)
+    check("grade 3 lowers EF by 0.14", abs(s3_hard.ease - 2.36) < 1e-9)
+    lapse = sm2.review(s3, 1)
+    check("lapse -> reps 0, interval 1 day", (lapse.repetitions, lapse.interval_days) == (0, 1))
+    check("lapse counted", lapse.lapses == 1)
+    check("lapse (grade 1) lowers EF by 0.54", abs(lapse.ease - (2.5 - 0.54)) < 1e-9)
+    relearn = sm2.review(sm2.review(lapse, 4), 4)
+    check("relearning restarts 1 -> 6", relearn.interval_days == 6)
+    floor = state
+    for _ in range(10):
+        floor = sm2.review(floor, 0)
+    check("EF never drops below 1.3", abs(floor.ease - 1.3) < 1e-9 and floor.lapses == 10)
+    try:
+        sm2.review(state, 6)
+    except ValueError:
+        check("grade outside 0..5 rejected", True)
+    else:
+        check("grade outside 0..5 rejected", False)
+    check(
+        "due_after adds the interval",
+        sm2.due_after(datetime(2026, 10, 4, 15, 0), s2) == datetime(2026, 10, 10, 15, 0),
+    )
+
+    print("\nDaily quiz clock (default Almaty UTC+5):")
+    check("'7:05' -> '07:05'", quiz_clock.parse_quiz_time("7:05") == "07:05")
+    check("'24:00' rejected", quiz_clock.parse_quiz_time("24:00") is None)
+    check("'+5' -> 300", quiz_clock.parse_utc_offset("+5") == 300)
+    check("'UTC+05:30' -> 330", quiz_clock.parse_utc_offset("UTC+05:30") == 330)
+    check("'-3' -> -180", quiz_clock.parse_utc_offset("-3") == -180)
+    check("'+15' rejected", quiz_clock.parse_utc_offset("+15") is None)
+
+    def due(now, last=None, time="20:00", enabled=True):
+        return quiz_clock.daily_due(
+            now_utc=now, quiz_time=time, utc_offset_minutes=300, enabled=enabled,
+            last_daily_date=last,
+        )  # fmt: skip
+
+    check("14:59 UTC (19:59 Almaty) -> not yet", not due(datetime(2026, 10, 4, 14, 59)))
+    check("15:00 UTC (20:00 Almaty) -> due", due(datetime(2026, 10, 4, 15, 0)))
+    check("already sent today -> not due", not due(datetime(2026, 10, 4, 16, 0), "2026-10-04"))
+    check(
+        "bot back at 23:30 the same day -> still sent once (gentle catch-up)",
+        due(datetime(2026, 10, 4, 18, 30), "2026-10-03"),
+    )
+    check(
+        "back after midnight, before quiz time -> waits (no 02:00 quiz)",
+        not due(datetime(2026, 10, 4, 21, 0), "2026-10-03"),
+    )
+    check(
+        "local date, not UTC date: 20:30 UTC = 01:30 next day in Almaty -> waits for 20:00",
+        not due(datetime(2026, 10, 4, 20, 30), "2026-10-04"),
+    )
+    check(
+        "... and fires at the next local 20:00",
+        due(datetime(2026, 10, 5, 15, 0), "2026-10-04"),
+    )
+    check("disabled -> never", not due(datetime(2026, 10, 4, 15, 0), enabled=False))
+
+
+async def flashcard_service_checks() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from harness.flashcards import FlashcardError, FlashcardService
+    from storage.flashcards import FlashcardStore, NewCard
+    from storage.knowledge import KnowledgeStore
+    from tools import flashcards as flashcard_tools
+
+    def cards_json(prefix: str, n: int) -> str:
+        return json.dumps(
+            {
+                "cards": [
+                    {"front": f"{prefix} сұрақ {i}?", "back": f"{prefix} жауап {i}"}
+                    for i in range(n)
+                ]
+            }
+        )
+
+    print("\nFlashcard extraction parsing:")
+    drafts = flashcard_tools.parse_cards(
+        json.dumps({"cards": [
+            {"front": "Q1?", "back": "A1"}, {"front": " q1? ", "back": "dup"},
+            {"front": "", "back": "x"}, {"front": "Same", "back": "same"},
+        ] + [{"front": f"F{i}?", "back": f"B{i}"} for i in range(20)]})
+    )  # fmt: skip
+    check(
+        "duplicates / empty / front==back dropped",
+        drafts[0].front == "Q1?" and drafts[1].front == "F0?",
+    )
+    check("capped at 15 cards per call", len(drafts) == 15)
+    try:
+        flashcard_tools.parse_cards("not json")
+    except flashcard_tools.FlashcardFormatError:
+        check("invalid JSON -> FlashcardFormatError", True)
+
+    print("\nFlashcard language enforced in code (§8):")
+    english = json.dumps({"cards": [{"front": "What is ATP?", "back": "Energy currency"}]})
+    russian = json.dumps({"cards": [{"front": "Что такое АТФ?", "back": "Источник энергии"}]})
+    kazakh = json.dumps({"cards": [{"front": "АТФ дегеніміз не?", "back": "Энергия көзі"}]})
+
+    class SequenceProvider(LLMProvider):
+        def __init__(self, replies: list[str]) -> None:
+            super().__init__(api_key="stub", model="stub")
+            self.name = "sequence"
+            self.replies = replies
+            self.turns: list[str] = []
+
+        async def complete(self, *, prompt: str, **_kwargs) -> str:
+            self.turns.append(prompt)
+            return self.replies[min(len(self.turns), len(self.replies)) - 1]
+
+    seq = SequenceProvider([english, kazakh])
+    cards = await flashcard_tools.generate_cards(LLMRouter([seq]), "text", user_message="/cards")
+    check("English reply for a Kazakh request -> one corrective retry", len(seq.turns) == 2)
+    check("... retry asks again explicitly", "NOT in Kazakh" in seq.turns[1])
+    check("... and the Kazakh cards are kept", cards[0].front == "АТФ дегеніміз не?")
+    for label, reply in (("English", english), ("Russian", russian)):
+        try:
+            await flashcard_tools.generate_cards(
+                LLMRouter([SequenceProvider([reply])]), "text", user_message="/cards"
+            )
+        except flashcard_tools.FlashcardLanguageError:
+            check(f"always {label} for a Kazakh request -> rejected, never stored", True)
+        else:
+            check(f"always {label} for a Kazakh request -> rejected, never stored", False)
+    seq = SequenceProvider([english])
+    await flashcard_tools.generate_cards(
+        LLMRouter([seq]), "text", user_message="make these in English please"
+    )
+    check("English request + English cards -> accepted first time", len(seq.turns) == 1)
+    check(
+        "first request already names the language natively",
+        "қазақ тілінде" in (await _first_turn(flashcard_tools)),
+    )
+    check(
+        "card budget sized for reasoning models (>= 4096 tokens)",
+        flashcard_tools.FLASHCARD_MAX_TOKENS >= 4096,
+    )
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        key = Fernet.generate_key()
+        embedder = HashEmbedder()
+        kstore = KnowledgeStore(
+            db_path=Path(tmp) / "k.db", page_dir=Path(tmp) / "p", encryption_key=key,
+            embedding_model=embedder.model_id, dimensions=embedder.dimensions,
+        )  # fmt: skip
+        await kstore.connect()
+        store = FlashcardStore(Path(tmp) / "cards.db")
+        await store.connect()
+        llm = CountingProvider("card-stub", cards_json("A", 6))
+        service = FlashcardService(
+            store=store, router=LLMRouter([llm]), knowledge_store=kstore,
+            default_daily_cap=3,
+        )  # fmt: skip
+        user_a, user_b = 111, 222
+        try:
+            print("\nFlashcards: PII gate before the LLM:")
+            for title, text in (
+                ("biology", "Mitosis has four phases\nprophase metaphase anaphase telophase"),
+                ("passport photo", SAMPLE_PASSPORT_OCR),
+            ):
+                await kstore.add_source(
+                    telegram_id=user_a, kind="page", title=title, chunks=[text],
+                    embeddings=await embedder.embed_documents([text]),
+                )  # fmt: skip
+            report = await service.make_from_knowledge(
+                telegram_id=user_a, chat_id=user_a, user_message="/cards make"
+            )
+            check("clean source sent to the LLM once", llm.calls == 1)
+            check(
+                "PII source NEVER sent (no prompt contains the IIN)",
+                not any("900101300123" in p for p in llm.prompts),
+            )
+            check("... and reported as withheld", report.segments_skipped_pii == 1)
+            check("6 cards created from the clean source", len(report.cards) == 6)
+            check(
+                "'/cards make' -> Kazakh cards ('make' is not English text)",
+                "(Reply language: Kazakh.)" in llm.prompts[-1],
+            )
+            try:
+                await service.make_from_knowledge(
+                    telegram_id=user_a, chat_id=user_a, user_message="/cards make"
+                )
+            except FlashcardError as exc:
+                check(
+                    "second run: every source already carded",
+                    str(exc) == strings.CARDS_ALL_SOURCES_DONE,
+                )
+
+            print("\nFlashcards: PDF sources:")
+            llm.reply = cards_json("PDF", 5)
+            pdf = tiny_text_pdf(
+                [f"Photosynthesis fact number {i}: chlorophyll absorbs light." for i in range(12)]
+            )
+            report = await service.make_from_pdf(
+                telegram_id=user_a, chat_id=user_a, data=pdf, filename="bio.pdf", user_message=""
+            )
+            check("text PDF -> cards", len(report.cards) == 5)
+            check("PDF text reached the prompt", "chlorophyll absorbs light" in llm.prompts[-1])
+            for label, data, expected in (
+                (
+                    "scanned PDF -> Kazakh /page hint, no LLM call",
+                    blank_pdf(3),
+                    strings.CARDS_PDF_SCANNED,
+                ),
+                ("same PDF again -> already done", pdf, strings.CARDS_PDF_ALREADY_DONE),
+            ):
+                calls = llm.calls
+                try:
+                    await service.make_from_pdf(
+                        telegram_id=user_a,
+                        chat_id=user_a,
+                        data=data,
+                        filename="x.pdf",
+                        user_message="",
+                    )
+                except FlashcardError as exc:
+                    check(label, str(exc) == expected and llm.calls == calls)
+                else:
+                    check(label, False)
+            try:
+                await service.make_from_pdf(
+                    telegram_id=user_a,
+                    chat_id=user_a,
+                    data=b"not a pdf",
+                    filename="x.pdf",
+                    user_message="",
+                )
+            except FlashcardError:
+                check("corrupt PDF -> clean error", True)
+            llm.reply = cards_json("PDF", 5)
+            pii_pdf = tiny_text_pdf(
+                [
+                    "REPUBLIC OF KAZAKHSTAN - PASSPORT",
+                    "IIN: 900101300123",
+                    "Surname: TESTOV  Given names: TESTBEK",
+                    "Date of birth: 01.01.1990  Date of expiry: 01.01.2030",
+                ]
+            )
+            calls = llm.calls
+            report = await service.make_from_pdf(
+                telegram_id=user_a, chat_id=user_a, data=pii_pdf, filename="id.pdf", user_message=""
+            )
+            check("PDF with passport text: NOT sent to the LLM", llm.calls == calls)
+            check(
+                "... withheld and reported", report.segments_skipped_pii == 1 and not report.cards
+            )
+
+            print("\nFlashcards: per-user isolation:")
+            card_a = report_card = await store.next_due_card(
+                telegram_id=user_a, now=datetime(2100, 1, 1)
+            )
+            assert report_card is not None
+            check(
+                "B cannot see A's card",
+                await store.get_card(telegram_id=user_b, card_id=card_a.id) is None,
+            )
+            check(
+                "B has nothing due",
+                await store.next_due_card(telegram_id=user_b, now=datetime(2100, 1, 1)) is None,
+            )
+            prompt_a = await service.start_session(
+                telegram_id=user_a, chat_id=user_a, kind="manual"
+            )
+            assert prompt_a is not None
+            check(
+                "B cannot answer A's question",
+                await service.answer_choice(telegram_id=user_b, item_id=prompt_a.item.id, choice=0)
+                is None,
+            )
+            check(
+                "B cannot rate A's question",
+                await service.rate(telegram_id=user_b, item_id=prompt_a.item.id, grade=4) is None,
+            )
+            check(
+                "B cannot reveal A's question",
+                await service.reveal(telegram_id=user_b, item_id=prompt_a.item.id) is None,
+            )
+            check(
+                "B cannot delete A's card",
+                await service.delete_card(telegram_id=user_b, card_id=card_a.id) is None,
+            )
+            check(
+                "... A's card still there",
+                await store.get_card(telegram_id=user_a, card_id=card_a.id) is not None,
+            )
+            check(
+                "B cannot write a review onto A's card",
+                not await store.save_review(
+                    telegram_id=user_b, card_id=card_a.id, state=card_a.state,
+                    due_at=datetime(2100, 1, 1), grade=5, mode="choice", now=datetime(2026, 1, 1),
+                ),
+            )  # fmt: skip
+            stats_b, _ = await service.stats(telegram_id=user_b, chat_id=user_b)
+            check("B's stats don't count A's cards", stats_b.total == 0)
+
+            print("\nQuiz session (multiple choice, SM-2, cap):")
+            check(
+                "enough cards -> multiple choice",
+                prompt_a.item.mode == "choice" and len(prompt_a.item.choices) == 4,
+            )
+            correct = prompt_a.item.correct_index
+            assert correct is not None
+            check(
+                "correct answer among the choices",
+                prompt_a.item.choices[correct] == prompt_a.card.back,
+            )
+            check(
+                "distractors are A's own other answers",
+                all(c.startswith(("A жауап", "PDF жауап")) for c in prompt_a.item.choices),
+            )
+            now = datetime.now(UTC).replace(tzinfo=None)
+            result = await service.answer_choice(
+                telegram_id=user_a, item_id=prompt_a.item.id, choice=correct, now=now
+            )
+            assert result is not None
+            check("correct choice -> grade 4", result.correct is True and result.grade == 4)
+            check("new card -> next review in 1 day", result.next_due_at - now == timedelta(days=1))
+            try:
+                await service.answer_choice(
+                    telegram_id=user_a, item_id=prompt_a.item.id, choice=correct
+                )
+            except FlashcardError as exc:
+                check("double tap can't grade twice", str(exc) == strings.QUIZ_ALREADY_ANSWERED)
+            second = result.next_prompt
+            assert second is not None
+            check("next card is a different card", second.card.id != prompt_a.card.id)
+            wrong = next(i for i in range(4) if i != second.item.correct_index)
+            result = await service.answer_choice(
+                telegram_id=user_a, item_id=second.item.id, choice=wrong, now=now
+            )
+            assert result is not None
+            check("wrong choice -> grade 1, lapse", result.correct is False and result.grade == 1)
+            third = result.next_prompt
+            assert third is not None
+            result = await service.rate(telegram_id=user_a, item_id=third.item.id, grade=5, now=now)
+            assert result is not None
+            check(
+                "daily cap 3 reached -> session over",
+                result.session_done and result.next_prompt is None,
+            )
+            check("session score counted", (result.session_asked, result.session_good) == (3, 2))
+
+            print("\nReveal + self-rating mode:")
+            long_back = "A long explanatory answer " * 5
+            await store.add_cards(
+                telegram_id=user_b, source_key="kb:x", source_title="t",
+                cards=[NewCard("Long question?", long_back, "long question?")], now=now,
+            )  # fmt: skip
+            prompt_b = await service.start_session(
+                telegram_id=user_b, chat_id=user_b, kind="manual"
+            )
+            assert prompt_b is not None
+            check("long answer / few cards -> reveal mode", prompt_b.item.mode == "reveal")
+            revealed = await service.reveal(telegram_id=user_b, item_id=prompt_b.item.id)
+            check(
+                "reveal returns the answer", revealed is not None and revealed[1].back == long_back
+            )
+            check(
+                "rating outside Again/Hard/Good/Easy rejected",
+                await service.rate(telegram_id=user_b, item_id=prompt_b.item.id, grade=2) is None,
+            )
+            result = await service.rate(
+                telegram_id=user_b, item_id=prompt_b.item.id, grade=1, now=now
+            )
+            assert result is not None
+            check("'Again' -> lapse, due tomorrow", result.next_due_at - now == timedelta(days=1))
+
+            print("\nDaily quiz scheduling (from the DB, gentle catch-up):")
+            # Make many of A's cards due: a backlog after "downtime".
+            await store.db.execute(
+                "UPDATE cards SET due_at = '2026-01-01 00:00:00' WHERE telegram_id = ?", (user_a,)
+            )
+            await store.db.commit()
+            base = datetime(2026, 10, 4)  # Almaty quiz time 20:00 = 15:00 UTC
+            started = await service.due_daily_sessions(base.replace(hour=14, minute=59))
+            check("before quiz time: nothing sent", not started)
+            started = await service.due_daily_sessions(base.replace(hour=15, minute=0))
+            users = {s.telegram_id for s, _ in started}
+            check("at quiz time: one session per user", users == {user_a, user_b})
+            check(
+                "A's session starts with one card",
+                any(s.telegram_id == user_a and p is not None for s, p in started),
+            )
+            check(
+                "next tick same day: nothing more",
+                not await service.due_daily_sessions(base.replace(hour=15, minute=1)),
+            )
+            prompt = next(p for s, p in started if s.telegram_id == user_a)
+            asked = 0
+            while prompt is not None:
+                asked += 1
+                result = await service.rate(
+                    telegram_id=user_a,
+                    item_id=prompt.item.id,
+                    grade=4,
+                    now=base.replace(hour=15, minute=2),
+                )
+                prompt = result.next_prompt if result else None
+            check(f"backlog of {12} due cards -> only the daily cap (3) asked", asked == 3)
+            later = base + timedelta(days=3, hours=16)  # down 3 days, back at 21:00 Almaty
+            started = await service.due_daily_sessions(later)
+            check(
+                "after 3 days down: exactly one session per user, not three",
+                len([s for s, _ in started if s.telegram_id == user_a]) == 1,
+            )
+
+            print("\nRestart survival:")
+            pending = next(p for s, p in started if s.telegram_id == user_a)
+            assert pending is not None
+            await store.close()
+            store2 = FlashcardStore(Path(tmp) / "cards.db")
+            await store2.connect()
+            service2 = FlashcardService(
+                store=store2, router=LLMRouter([llm]), knowledge_store=kstore, default_daily_cap=3
+            )
+            check(
+                "after restart: no re-send of today's quiz",
+                not await service2.due_daily_sessions(later + timedelta(minutes=5)),
+            )
+            result = await service2.rate(
+                telegram_id=user_a, item_id=pending.item.id, grade=4, now=later
+            )
+            check("after restart: the button sent before it still works", result is not None)
+            deleted = await service2.delete_card(telegram_id=user_a, card_id=card_a.id)
+            check("owner can delete their card", deleted is not None)
+            check(
+                "... and it's gone",
+                await store2.get_card(telegram_id=user_a, card_id=card_a.id) is None,
+            )
+            await store2.close()
+        finally:
+            await store.close()
+            await kstore.close()
+
+    print("\nGroq structured-output flake is retried, not dropped:")
+    import httpx
+
+    from providers.base import ProviderUnavailable
+    from providers.openai_compatible import GroqProvider
+
+    groq = GroqProvider(api_key="stub", model="openai/gpt-oss-120b")
+    flake = httpx.Response(
+        400,
+        text='{"error":{"code":"json_validate_failed",'
+        '"message":"Generated JSON does not match the expected schema."}}',
+    )
+    try:
+        groq._raise_for_status(flake)
+    except ProviderUnavailable:
+        check("json_validate_failed 400 -> retryable (ProviderUnavailable)", True)
+    else:
+        check("json_validate_failed 400 -> retryable (ProviderUnavailable)", False)
+
+
+async def flashcard_routing_checks() -> None:
+    """Commands + inline-button callbacks through the real router and the real
+    FlashcardService (temp store, stub LLM) — no network."""
+    from datetime import UTC, datetime
+
+    from aiogram import Bot
+    from aiogram.client.session.base import BaseSession
+    from aiogram.types import CallbackQuery, Chat, Message, Update, User
+
+    from harness.flashcards import FlashcardService
+    from storage.flashcards import FlashcardStore, NewCard
+
+    print("\nFlashcard commands and buttons (Telegram routing):")
+
+    class Session(BaseSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list = []
+
+        async def make_request(self, bot, method, timeout=None):
+            self.calls.append(method)
+            if method.__returning__ is User:
+                return User(id=42, is_bot=True, first_name="Harness", username="HarnessBot")
+            if method.__returning__ is Message or "Message" in str(method.__returning__):
+                return Message(
+                    message_id=len(self.calls) + 500,
+                    date=datetime.now(),
+                    chat=Chat(id=1, type="private"),
+                    text="x",
+                )
+            return True
+
+        async def stream_content(self, *args, **kwargs):  # pragma: no cover
+            yield b""
+
+        async def close(self) -> None:
+            pass
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        store = FlashcardStore(Path(tmp) / "cards.db")
+        await store.connect()
+        service = FlashcardService(
+            store=store, router=LLMRouter([CountingProvider("x", "{}")]), default_daily_cap=10
+        )
+        now = datetime.now(UTC).replace(tzinfo=None)
+        cards = await store.add_cards(
+            telegram_id=1, source_key="kb:1", source_title="Биология",
+            cards=[NewCard(f"Сұрақ {i}?", f"Жауап {i}", f"сұрақ {i}?") for i in range(5)], now=now,
+        )  # fmt: skip
+        try:
+            session = Session()
+            bot = Bot(token="42:offline-selfcheck", session=session)
+            # Full root router (real handler order — e.g. the tutor's catch-all
+            # must not swallow these), with only the flashcard service wired.
+            dp = shared_dispatcher()
+            services = {
+                "flashcards": service,
+                "harness": None,
+                "media": None,
+                "archive": None,
+                "knowledge": None,
+                "settings": None,
+            }
+            update_id = 0
+
+            async def feed(update_kwargs):
+                nonlocal update_id
+                update_id += 1
+                session.calls.clear()
+                await dp.feed_update(bot, Update(update_id=update_id, **update_kwargs), **services)
+
+            def message(text, user=1):
+                return {"message": Message(
+                    message_id=update_id + 1, date=datetime.now(),
+                    chat=Chat(id=user, type="private"),
+                    from_user=User(id=user, is_bot=False, first_name="T"), text=text,
+                )}  # fmt: skip
+
+            def press(data, user=1):
+                return {"callback_query": CallbackQuery(
+                    id=str(update_id), from_user=User(id=user, is_bot=False, first_name="T"),
+                    chat_instance="ci", data=data,
+                    message=Message(
+                        message_id=900, date=datetime.now(),
+                        chat=Chat(id=user, type="private"), text="q",
+                    ),
+                )}  # fmt: skip
+
+            def sent(name):
+                return [c for c in session.calls if type(c).__name__ == name]
+
+            await feed(message("/cards"))
+            check("/cards shows stats (Kazakh)", "Карточкалар: 5" in sent("SendMessage")[0].text)
+            await feed(message("/quiz"))
+            quiz = sent("SendMessage")
+            check(
+                "/quiz sends a card with inline buttons", quiz and quiz[0].reply_markup is not None
+            )
+            buttons = [b for row in quiz[0].reply_markup.inline_keyboard for b in row]
+            check(
+                "multiple choice: 4 answer buttons",
+                len(buttons) == 4 and all(b.callback_data.startswith("fc:a:") for b in buttons),
+            )
+            item_id = int(buttons[0].callback_data.split(":")[2])
+            await feed(press(buttons[0].callback_data, user=2))
+            alerts = sent("AnswerCallbackQuery")
+            check(
+                "another user pressing A's button -> alert, nothing graded",
+                alerts
+                and alerts[0].show_alert
+                and (await store.get_item(telegram_id=1, item_id=item_id)).answered is False,
+            )
+            await feed(press(buttons[0].callback_data))
+            check(
+                "owner's press grades it and edits the message",
+                sent("EditMessageText")
+                and (await store.get_item(telegram_id=1, item_id=item_id)).answered,
+            )
+            check("... and the next card follows", any(m.reply_markup for m in sent("SendMessage")))
+            await feed(press(buttons[0].callback_data))
+            check(
+                "pressing again -> 'already answered' alert",
+                sent("AnswerCallbackQuery")[0].text == strings.QUIZ_ALREADY_ANSWERED,
+            )
+
+            await feed(message("/quiztime 07:30 +6"))
+            settings = await store.get_settings(telegram_id=1)
+            check(
+                "/quiztime 07:30 +6 saved",
+                settings and (settings.quiz_time, settings.utc_offset_minutes) == ("07:30", 360),
+            )
+            await feed(message("/quiztime cap 4"))
+            check("/quiztime cap 4 saved", (await store.get_settings(telegram_id=1)).daily_cap == 4)
+            await feed(message("/quiztime 25:00"))
+            check("bad time -> Kazakh usage", sent("SendMessage")[0].text == strings.QUIZTIME_BAD)
+            await feed(message("/quiztime off"))
+            check(
+                "/quiztime off disables", (await store.get_settings(telegram_id=1)).enabled is False
+            )
+
+            target = cards[-1]
+            await feed(message(f"/delcard {target.id}", user=2))
+            check(
+                "/delcard of another user's card -> not found",
+                sent("SendMessage")[0].text == strings.DELCARD_NOT_FOUND.format(id=target.id),
+            )
+            await feed(message(f"/delcard {target.id}"))
+            confirm = sent("SendMessage")[0]
+            check(
+                "/delcard asks for confirmation first",
+                "#" in confirm.text and confirm.reply_markup is not None,
+            )
+            check(
+                "... nothing deleted yet",
+                await store.get_card(telegram_id=1, card_id=target.id) is not None,
+            )
+            await feed(press(f"fc:d:{target.id}:y", user=2))
+            check(
+                "another user pressing 'Yes' deletes nothing",
+                await store.get_card(telegram_id=1, card_id=target.id) is not None,
+            )
+            await feed(press(f"fc:d:{target.id}:n"))
+            check(
+                "'No' keeps the card",
+                await store.get_card(telegram_id=1, card_id=target.id) is not None,
+            )
+            await feed(press(f"fc:d:{target.id}:y"))
+            check(
+                "'Yes' deletes it", await store.get_card(telegram_id=1, card_id=target.id) is None
+            )
+        finally:
+            await store.close()
+            if "bot" in locals():
+                await bot.session.close()
+
+
+async def quiz_mode_checks() -> None:
+    """Phase 5b.1: why a card is multiple choice or show-answer, short answers +
+    generated wrong options, migration, PII on generated text, truncation."""
+    import logging
+    import sqlite3
+    from datetime import UTC, datetime
+
+    import httpx
+
+    from harness.flashcards import FlashcardService
+    from providers.base import ProviderError
+    from providers.gemini import GeminiProvider
+    from providers.openai_compatible import GroqProvider
+    from storage.flashcards import FlashcardStore, NewCard
+    from tools import flashcards as flashcard_tools
+    from tools import quiz_mode
+
+    print("\nWrong-option validation:")
+    ok = quiz_mode.option_ok
+    check(
+        "an option equal to the answer is rejected (case/punctuation-insensitive)",
+        not ok("Митоз", " митоз. "),
+    )
+    check("a plausible same-kind option is accepted", ok("Митоз", "Мейоз"))
+    check("a year for a year: '1838' vs '1855' accepted", ok("1838", "1855"))
+    check("shape mismatch (number vs word) rejected", not ok("1838", "Шлейден"))
+    check("script mismatch (Cyrillic vs Latin) rejected", not ok("Митоз", "Mitosis"))
+    check(
+        "far longer than the answer rejected", not ok("АТФ", "Аденозинтрифосфат қышқылының қалдығы")
+    )
+    check("over 60 chars rejected", not ok("Жауап", "ж" * 61))
+    picked = quiz_mode.pick_options(
+        "Митоз", ["Мейоз", "мейоз", "Митоз", "Амитоз", "Мейоз!", "Эндомитоз"]
+    )
+    check(
+        f"duplicates and the answer removed, 3 kept: {picked}",
+        picked == ["Мейоз", "Амитоз", "Эндомитоз"],
+    )
+
+    print("\nGeneration output validation:")
+    stats = flashcard_tools.ParseStats()
+    drafts = flashcard_tools.parse_cards(
+        json.dumps({"cards": [
+            {"front": "Жасушаның бөліну түрі?", "back": "Митоз", "explanation": "",
+             "wrong_options": ["Митоз", "Мейоз", "мейоз", "Амитоз", "Mitosis", "Эндомитоз"]},
+            {"front": "Ұзақ жауап?", "back": "Бұл жауап өте ұзақ, өйткені модель түсіндірмені де жауапқа жазып жіберді.",  # noqa: E501
+             "explanation": "", "wrong_options": ["А", "Б", "В"]},
+        ]}),
+        stats,
+    )  # fmt: skip
+    check(
+        "valid options stored with the card", drafts[0].options == ("Мейоз", "Амитоз", "Эндомитоз")
+    )
+    check("long 'back' kept as a card but with no options", drafts[1].options == ())
+    check(
+        "long answers and rejected options counted",
+        stats.long_answers == 1 and stats.options_rejected >= 3,
+    )
+    check(
+        "schema asks for explanation + wrong_options and requires them (strict mode)",
+        set(flashcard_tools._CARDS_SCHEMA["properties"]["cards"]["items"]["required"])
+        == {"front", "back", "explanation", "wrong_options"},
+    )
+
+    print("\nMode decision (pure):")
+    d = quiz_mode.choose_mode("Бұл жауап тым ұзақ: " + "сөз " * 15, [], ["Мейоз"] * 5, [])
+    check(
+        f"long answer -> show_answer/answer_too_long (len {d.answer_len})",
+        (d.mode, d.reason) == ("show_answer", "answer_too_long"),
+    )
+    d = quiz_mode.choose_mode("Митоз", ["Мейоз", "Амитоз", "Эндомитоз"], [], [])
+    check(
+        "short answer + 3 stored options, empty deck -> multiple_choice",
+        d.mode == "multiple_choice" and d.stored_options == 3,
+    )
+    d = quiz_mode.choose_mode("Митоз", ["Мейоз"], ["Амитоз"], ["Эндомитоз", "Шванн"])
+    check(
+        "stored first, then same source, then others",
+        d.options[:2] == ["Мейоз", "Амитоз"] and d.mode == "multiple_choice",
+    )
+    d = quiz_mode.choose_mode("Митоз", ["Митоз", "митоз"], [], ["1838"])
+    check(
+        f"only invalid candidates -> show_answer/too_few_distractors ({d.candidates} valid)",
+        (d.mode, d.reason) == ("show_answer", "too_few_distractors"),
+    )
+
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    fc_logger = logging.getLogger("harness.flashcards")
+    handler = Capture()
+    fc_logger.addHandler(handler)
+    previous = fc_logger.level
+    fc_logger.setLevel(logging.INFO)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        store = FlashcardStore(Path(tmp) / "cards.db")
+        await store.connect()
+        try:
+            now = datetime.now(UTC).replace(tzinfo=None)
+            print("\nQuiz mode is logged per card (no card text):")
+            short, long_ = await store.add_cards(
+                telegram_id=7, source_key="kb:1", source_title="Биология",
+                cards=[
+                    NewCard("Жасушаның бөліну түрі?", "Митоз", "жасушаның бөліну түрі?",
+                            explanation="Соматикалық жасушалар митоз арқылы бөлінеді.",
+                            options=("Мейоз", "Амитоз", "Эндомитоз")),
+                    NewCard("Ұзақ сұрақ?", "Бұл жауап өте ұзақ, өйткені ол бір емес бірнеше сөйлемнен тұрады.", "ұзақ сұрақ?"),  # noqa: E501
+                ],
+                now=now,
+            )  # fmt: skip
+            service = FlashcardService(store=store, router=LLMRouter([CountingProvider("x", "{}")]))
+            prompt = await service.start_session(telegram_id=7, chat_id=7, kind="manual", now=now)
+            assert prompt is not None
+            lines = [r.getMessage() for r in records if r.getMessage().startswith("quiz mode")]
+            check(
+                f"short answer with stored options -> multiple_choice: {lines[-1]!r}",
+                prompt.item.mode == "choice" and "mode=multiple_choice reason=-" in lines[-1],
+            )
+            check(
+                "... only one other card exists, so the stored options did it",
+                "stored_options=3" in lines[-1],
+            )
+            check(
+                "... and the 4 buttons are the answer + its stored options",
+                sorted(prompt.item.choices) == sorted(["Митоз", "Мейоз", "Амитоз", "Эндомитоз"]),
+            )
+            result = await service.answer_choice(
+                telegram_id=7, item_id=prompt.item.id, choice=prompt.item.correct_index, now=now
+            )
+            lines = [r.getMessage() for r in records if r.getMessage().startswith("quiz mode")]
+            check(
+                f"long answer -> show_answer with reason: {lines[-1]!r}",
+                result.next_prompt.item.mode == "reveal"
+                and "mode=show_answer reason=answer_too_long" in lines[-1],
+            )
+            check("answer length is in the log line", f"answer_len={len(long_.back)}" in lines[-1])
+            check(
+                "no card text in any quiz-mode log line",
+                not any(t in line for line in lines for t in ("Митоз", "Мейоз", "Ұзақ", "жауап")),
+            )
+            from bot.quiz import render_result
+
+            check(
+                "explanation shown after the answer",
+                "Соматикалық жасушалар" in render_result(result),
+            )
+            check(
+                "/cards multiple-choice count: 1 of 2",
+                await service.multiple_choice_count(telegram_id=7) == 1,
+            )
+
+            print("\nPII gate on generated cards and options:")
+            gen = CountingProvider("gen", json.dumps({"cards": [
+                {"front": "Тәуелсіздік жылы?", "back": "1991", "explanation": "",
+                 "wrong_options": ["1986", "900101300123", "1995", "1990"]},
+                {"front": "Шетелге шығу құжаты?", "back": "Төлқұжат", "explanation": "", "wrong_options": []},  # noqa: E501
+            ]}))  # fmt: skip
+            service = FlashcardService(store=store, router=LLMRouter([gen]))
+            pdf = tiny_text_pdf(
+                [f"Independence history fact number {i} for the lesson." for i in range(10)]
+            )
+            report = await service.make_from_pdf(
+                telegram_id=7, chat_id=7, data=pdf, filename="h.pdf", user_message=""
+            )
+            stored = [c for c in report.cards if c.back == "1991"]
+            check(
+                'card whose own text trips the gate ("Төлқұжат") is not stored',
+                report.cards_dropped_pii == 1 and len(report.cards) == 1,
+            )
+            check(
+                f"IIN-shaped option dropped, a spare takes its place: {stored[0].options}",
+                stored[0].options == ["1986", "1995", "1990"],
+            )
+        finally:
+            await store.close()
+            fc_logger.removeHandler(handler)
+            fc_logger.setLevel(previous)
+
+    print("\nMigration of existing cards (no rewriting):")
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = Path(tmp) / "old.db"
+        old = sqlite3.connect(path)
+        old.executescript(
+            "CREATE TABLE cards (id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER NOT NULL, "  # noqa: E501
+            "front TEXT NOT NULL, back TEXT NOT NULL, front_key TEXT NOT NULL, source_key TEXT NOT NULL, "  # noqa: E501
+            "source_title TEXT NOT NULL, ease REAL NOT NULL DEFAULT 2.5, interval_days INTEGER NOT NULL DEFAULT 0, "  # noqa: E501
+            "repetitions INTEGER NOT NULL DEFAULT 0, lapses INTEGER NOT NULL DEFAULT 0, due_at TEXT NOT NULL, "  # noqa: E501
+            "last_reviewed_at TEXT, created_at TEXT NOT NULL, UNIQUE (telegram_id, front_key));"
+        )  # fmt: skip
+        long_text = "Ескі ұзын жауап: " + "түсіндірме " * 8
+        for front, back in (("Қысқа?", "Митоз"), ("Ұзын?", long_text)):
+            old.execute(
+                "INSERT INTO cards (telegram_id, front, back, front_key, source_key, source_title, due_at, created_at) "  # noqa: E501
+                "VALUES (1, ?, ?, ?, 'kb:1', 't', '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+                (front, back, front.lower()),
+            )  # fmt: skip
+        old.commit()
+        old.close()
+        store = FlashcardStore(path)
+        await store.connect()
+        try:
+            cards = {c.front: c for c in await store.all_cards(telegram_id=1)}
+            check(
+                "long answer copied into explanation verbatim",
+                cards["Ұзын?"].explanation == long_text,
+            )
+            check("... and the answer itself not rewritten", cards["Ұзын?"].back == long_text)
+            check(
+                "short answer: no explanation added",
+                cards["Қысқа?"].explanation is None and cards["Қысқа?"].back == "Митоз",
+            )
+            check("existing cards start with no stored options", cards["Қысқа?"].options == [])
+        finally:
+            await store.close()
+        store = FlashcardStore(path)
+        await store.connect()
+        await store.close()
+        check("migration is idempotent (second open is a no-op)", True)
+
+    print("\nTruncated structured output is rejected, not silently shortened:")
+
+    def mock(payload: dict) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _req: httpx.Response(200, json=payload))
+        )
+
+    groq = GroqProvider(api_key="stub", model="openai/gpt-oss-120b")
+    groq._client = mock(
+        {"choices": [{"message": {"content": '{"cards": []}'}, "finish_reason": "length"}]}
+    )
+    try:
+        await groq.complete(prompt="x", json_schema={"type": "object"})
+    except ProviderError as exc:
+        check("Groq finish_reason=length with a schema -> ProviderError", "truncated" in str(exc))
+    else:
+        check("Groq finish_reason=length with a schema -> ProviderError", False)
+    groq._client = mock(
+        {"choices": [{"message": {"content": "plain text"}, "finish_reason": "length"}]}
+    )
+    check("... plain-text replies are unaffected", await groq.complete(prompt="x") == "plain text")
+    await groq.aclose()
+    gemini = GeminiProvider(api_key="stub", model="m")
+    gemini._client = mock(
+        {
+            "candidates": [
+                {"content": {"parts": [{"text": '{"cards": []}'}]}, "finishReason": "MAX_TOKENS"}
+            ]
+        }
+    )
+    try:
+        await gemini.complete(prompt="x", json_schema={"type": "object"})
+    except ProviderError as exc:
+        check(
+            "Gemini finishReason=MAX_TOKENS with a schema -> ProviderError", "truncated" in str(exc)
+        )
+    else:
+        check("Gemini finishReason=MAX_TOKENS with a schema -> ProviderError", False)
+    await gemini.aclose()
+    check(
+        "card budget raised for the larger schema (8192)",
+        flashcard_tools.FLASHCARD_MAX_TOKENS == 8192,
+    )
+
+
 async def download_check(url: str, *, convert_to_mp3: bool) -> None:
     """Run the Phase 4 generalized downloader (no Telegram) and print what
     would be sent — the real-network counterpart of `phase4_offline_checks`."""
@@ -1714,6 +2709,10 @@ async def main() -> None:
     pii_gate_regression_checks()
     await archive_fallback_and_delete_checks()
     await ask_outcome_logging_checks()
+    sm2_and_clock_checks()
+    await flashcard_service_checks()
+    await flashcard_routing_checks()
+    await quiz_mode_checks()
     if "--live" in sys.argv:
         await live_check()
     print("\nAll checks passed.")

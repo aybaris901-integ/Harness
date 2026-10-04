@@ -15,7 +15,7 @@ import strings
 from bot.handlers import build_root_router
 from bot.middlewares import AccessMiddleware, UserTrackingMiddleware
 from config import Settings
-from harness import DocumentArchive, Harness, KnowledgeBase, MediaPipeline
+from harness import DocumentArchive, FlashcardService, Harness, KnowledgeBase, MediaPipeline
 from storage import Storage
 
 BOT_COMMANDS = [
@@ -26,6 +26,10 @@ BOT_COMMANDS = [
     BotCommand(command="delete", description=strings.CMD_DELETE_DESC),
     BotCommand(command="ask", description=strings.CMD_ASK_DESC),
     BotCommand(command="page", description=strings.CMD_PAGE_DESC),
+    BotCommand(command="cards", description=strings.CMD_CARDS_DESC),
+    BotCommand(command="quiz", description=strings.CMD_QUIZ_DESC),
+    BotCommand(command="quiztime", description=strings.CMD_QUIZTIME_DESC),
+    BotCommand(command="delcard", description=strings.CMD_DELCARD_DESC),
     BotCommand(command="reset", description=strings.CMD_RESET_DESC),
     BotCommand(command="cancel", description=strings.CMD_CANCEL_DESC),
     BotCommand(command="help", description=strings.CMD_HELP_DESC),
@@ -47,6 +51,7 @@ def create_dispatcher(
     archive: DocumentArchive,
     media: MediaPipeline,
     knowledge: KnowledgeBase | None,
+    flashcards: FlashcardService | None,
 ) -> Dispatcher:
     # MemoryStorage: FSM position resets on restart, which is fine — the actual
     # conversation lives in SQLite and is reloaded on the next turn.
@@ -57,10 +62,14 @@ def create_dispatcher(
         archive=archive,
         media=media,
         knowledge=knowledge,
+        flashcards=flashcards,
     )
 
     dp.message.outer_middleware(AccessMiddleware(settings))
     dp.message.outer_middleware(UserTrackingMiddleware(storage))
+    # Inline buttons (Phase 5b quizzes) arrive as callback queries, which the
+    # message middlewares never see — gate them with the same whitelist.
+    dp.callback_query.outer_middleware(AccessMiddleware(settings))
 
     dp.include_router(build_root_router())
     return dp

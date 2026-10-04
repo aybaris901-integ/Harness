@@ -2,9 +2,10 @@
 
 Agent harness over free-tier LLMs. See `CLAUDE.md` for the full spec and roadmap.
 
-**Current status: Phase 5a** — tutor + link/video summarizer + document archive +
+**Current status: Phase 5b** — tutor + link/video summarizer + document archive +
 generalized media downloader + screenshot notes + RAG knowledge base (`/ask`,
-notebook pages via `/page`). Flashcards/quizzes are Phase 5b, not built yet.
+notebook pages via `/page`) + flashcards with SM-2 spaced repetition and a
+daily quiz (`/cards`, `/quiz`, `/quiztime`, `/delcard`, PDFs).
 
 ## Layout
 
@@ -19,6 +20,7 @@ harness/
   documents.py       Phase 3 route: OCR -> field extraction -> encrypted storage -> search
   media.py           Phase 4 route: any-URL download/convert + screenshot OCR -> note staging
   knowledge.py       Phase 5a route: PII gate -> vision transcription -> embed/index; /ask
+  flashcards.py      Phase 5b route: source text -> PII gate -> cards; quiz sessions; daily due
   prompts.py         system prompts, verbatim from CLAUDE.md §9 (+ Phase 4's own, see file)
 strings.py           every static, non-LLM user-facing string (CLAUDE.md §8) — Kazakh
 bot/
@@ -28,6 +30,8 @@ bot/
     documents.py     photo uploads + /find; document archive only
     media.py         /download (background job) + photos captioned /note
     knowledge.py     /ask + photos captioned /page (notebook pages)
+    flashcards.py    /cards, /quiz, /quiztime, /delcard, PDF uploads, quiz buttons
+  quiz.py            quiz rendering + the daily-quiz scheduler loop (state in SQLite)
   middlewares.py     whitelist gate + user tracking
   states.py          FSM states
 storage/
@@ -36,6 +40,7 @@ storage/
   notes.py           plain SQLite staging table for Phase 4 screenshot notes (source for 5a)
   knowledge.py       sqlite-vec index: sources/chunks/vectors, partitioned per user
   encrypted_files.py Fernet-encrypted files: document scans + notebook page photos
+  flashcards.py      cards + SM-2 state + reviews + quiz settings/sessions/items, per user
 tools/               standalone pipelines, no bot/harness imports
   urls.py            URL detection + article/video classification
   article.py         httpx fetch -> trafilatura extraction
@@ -48,6 +53,10 @@ tools/               standalone pipelines, no bot/harness imports
   ocr.py             local Tesseract OCR — never a cloud vision API (CLAUDE.md §5)
   vision_ocr.py      handwriting transcription via the vision chain (after the PII gate)
   rag.py             chunking + grounded answer with structured output
+  flashcards.py      §9 flashcard prompt + schema, language verified in code
+  sm2.py             SM-2 spaced repetition (pure functions)
+  quiz_clock.py      daily-quiz time rules: fixed UTC offset, once per local day
+  pdf_text.py        pypdf text-layer extraction; detects scanned PDFs
   document_fields.py regex/heuristic field extraction + search-query scoring
 scripts/selfcheck.py local sanity check, no Telegram needed
 ```
@@ -204,6 +213,56 @@ did those. Two optional settings, both with working defaults:
 - Existing `/note` staging rows are migrated into the index on every start
   (idempotent, in the background); new `/note`s are indexed as they are saved.
 
+### Phase 5b extras (flashcards + daily quiz) — one new package, no new keys
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt   # adds pypdf (pure Python)
+```
+
+- **Sources**: knowledge-base pages/notes (`/cards make`, at most
+  `CARDS_MAX_SOURCES_PER_RUN` sources per command) and text PDFs sent as a
+  document. Scanned PDFs (no text layer) get a Kazakh reply pointing to `/page`.
+- **PII gate**: every text segment is checked with `has_pii_signals` before the
+  LLM call; a flagged segment is skipped, counted in the reply, and never sent.
+- **Card language** is decided in code (§8) *and verified*: the §9 prompt is
+  English, and Groq `gpt-oss` returned 15/15 English cards for a Kazakh request
+  until the instruction was made explicit. Cards for a Kazakh request must
+  contain Kazakh-specific letters (rejects English and Russian); one corrective
+  retry, then the segment is dropped rather than stored in the wrong language.
+- **Card shape**: `back` is a short answer (≤ 60 chars), `explanation` is
+  optional and shown after the answer, and each card is generated with 3 wrong
+  `wrong_options`, validated in code (`tools/quiz_mode.py`: not equal to the
+  answer, no duplicates, similar length, same script, digits only for numeric
+  answers) and PII-gated like the card text. Existing cards are migrated
+  without rewriting: an old long answer is copied into `explanation` and stays
+  a show-answer card.
+- **Quiz mode** per card: multiple choice from the card's own options, then
+  same-source answers, then the user's other answers; otherwise show-answer.
+  Every card asked logs `quiz mode … mode=… reason=answer_too_long|
+  too_few_distractors|other answer_len=… stored_options=… candidates=…` (no
+  card text); `/cards` shows how many cards support multiple choice.
+- **Token budget** (`FLASHCARD_MAX_TOKENS = 8192`), measured with the full
+  schema on Groq `gpt-oss-120b`: default effort 1460-1758 reasoning / up to
+  2601 completion tokens (2048 failed with `json_validate_failed`); `low` effort
+  34-50 reasoning / ≤ 989 completion. A structured reply still cut at
+  `max_tokens` (`finish_reason=length` / `MAX_TOKENS`) is now an error, never a
+  silently shorter deck. A Groq 400 `json_validate_failed` is retried on the
+  same provider instead of falling through.
+- **SM-2** as published: intervals 1 → 6 → round(prev × EF); lapse (grade < 3)
+  resets to 1 day; EF updated every review, floor 1.3. Multiple choice: correct
+  = grade 4, wrong = 1. Reveal mode: Again 1 / Hard 3 / Good 4 / Easy 5.
+- **Daily quiz**: default 20:00 Almaty (UTC+5), `QUIZ_DAILY_CAP` cards, one card
+  at a time (the next follows each answer). Due-ness is recomputed from SQLite
+  every minute — no in-memory jobs, so a restart changes nothing. At most one
+  session per user per local day: after downtime the same day it still goes
+  out once; missed earlier days are not replayed; after midnight it waits for
+  the quiz time. A failed delivery is not retried every minute (the day is
+  claimed before sending).
+- Not APScheduler (CLAUDE.md §3 names it): with all state in the DB, the only
+  job left is "check every minute", a 20-line asyncio loop in `bot/quiz.py`.
+- Inline buttons are callback queries: the whitelist middleware now gates them
+  too, and every button resolves its ids with the presser's own Telegram id.
+
 ## Run
 
 ```powershell
@@ -315,6 +374,12 @@ chunk with its score and the final answer. Keep test photos outside the repo:
 | a passport photo captioned `/page` | ⚠️ redirected to the encrypted document archive, never sent to a vision API |
 | `/ask <question>` | Kazakh answer with [n] citations, 📎 source line(s), then the original page photo if it came from a page |
 | `/ask` about something not in your notes | static Kazakh "nothing found in your notes" — no answer from model knowledge |
+| `/cards make` | 🃏 N new cards (Kazakh) from knowledge-base sources without cards yet, first few listed with `#id` |
+| a text PDF (document) | cards from its text; scanned PDF → Kazakh reply suggesting `/page` |
+| `/cards` | stats: total, due now, new, learned, reviewed today, next review, daily quiz time |
+| `/quiz` | one card: 4 answer buttons (multiple choice) or "show answer" → Again/Hard/Good/Easy; the next card follows each answer, up to the daily cap |
+| `/quiztime 20:00 +5` / `/quiztime cap 15` / `/quiztime off` | daily quiz time + UTC offset / per-day cap / disable |
+| `/delcard <id>` | shows the card with Yes/No buttons; deleted only on "Yes" |
 | a voice message or a non-image file | "text, links and document photos only" |
 
 Replies follow the CLAUDE.md language policy: Kazakh by default, English if

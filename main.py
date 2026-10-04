@@ -10,10 +10,19 @@ import logging
 import sys
 
 from bot import create_bot, create_dispatcher, set_bot_commands
+from bot.quiz import QuizScheduler
 from config import ConfigError, Settings, load_settings
-from harness import DocumentArchive, Harness, KnowledgeBase, LinkSummarizer, MediaPipeline
+from harness import (
+    DocumentArchive,
+    FlashcardService,
+    Harness,
+    KnowledgeBase,
+    LinkSummarizer,
+    MediaPipeline,
+)
 from llm_router import build_embedder, build_router, build_vision_router
 from storage import DocumentStore, NoteStore, Storage
+from storage.flashcards import FlashcardStore
 from storage.knowledge import KnowledgeStore, KnowledgeStoreError
 from tools.transcriber import Transcriber
 
@@ -127,6 +136,22 @@ async def run(settings: Settings) -> None:
     )
     logger.info(media.describe())
 
+    # Phase 5b: flashcards + spaced repetition. Sources come from the knowledge
+    # base when it is enabled; PDFs work either way.
+    flashcard_store = FlashcardStore(settings.flashcards_db_path)
+    await flashcard_store.connect()
+    flashcards = FlashcardService(
+        store=flashcard_store,
+        router=llm,
+        knowledge_store=knowledge_store,
+        default_quiz_time=settings.quiz_default_time,
+        default_utc_offset_minutes=settings.quiz_utc_offset_minutes,
+        default_daily_cap=settings.quiz_daily_cap,
+        max_sources_per_run=settings.cards_max_sources_per_run,
+        pdf_max_mb=settings.pdf_max_mb,
+    )
+    logger.info(flashcards.describe())
+
     bot = create_bot(settings)
     dp = create_dispatcher(
         settings=settings,
@@ -135,7 +160,11 @@ async def run(settings: Settings) -> None:
         archive=archive,
         media=media,
         knowledge=knowledge,
+        flashcards=flashcards,
     )
+    # Daily quiz: due-ness is recomputed from the DB every tick, so starting
+    # it is all a restart needs.
+    quiz_scheduler = QuizScheduler(bot, flashcards)
 
     migration: asyncio.Task[int] | None = None
     if knowledge is not None:
@@ -152,9 +181,11 @@ async def run(settings: Settings) -> None:
             logger.warning("ALLOWED_USER_IDS is empty — the bot replies to anyone")
 
         await set_bot_commands(bot)
+        quiz_scheduler.start()
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
+        await quiz_scheduler.stop()
         if migration is not None and not migration.done():
             migration.cancel()
         await llm.aclose()
@@ -167,6 +198,7 @@ async def run(settings: Settings) -> None:
         await storage.close()
         await document_store.close()
         await note_store.close()
+        await flashcard_store.close()
         await bot.session.close()
         logger.info("Shut down cleanly")
 

@@ -141,7 +141,16 @@ class GeminiProvider(LLMProvider):
             raise ProviderUnavailable(self.name, f"request failed: {exc}") from exc
 
         self._raise_for_status(response)
-        return self._extract_text(response.json())
+        data = response.json()
+        text = self._extract_text(data)
+        finish = ((data.get("candidates") or [{}])[0]).get("finishReason")
+        if json_schema is not None and finish == "MAX_TOKENS":
+            # Same rule as the OpenAI-compatible providers: a structured reply
+            # cut at maxOutputTokens is incomplete even if it parses.
+            raise ProviderError(
+                self.name, "structured output truncated at max_tokens (finishReason=MAX_TOKENS)"
+            )
+        return text
 
     async def embed(
         self, texts: Sequence[str], *, task_type: str, output_dimensionality: int

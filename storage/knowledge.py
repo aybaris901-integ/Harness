@@ -297,3 +297,39 @@ class KnowledgeStore:
             "SELECT COUNT(*) FROM sources WHERE telegram_id = ?", (telegram_id,)
         )
         return int(value or 0)
+
+    async def list_sources(self, *, telegram_id: int) -> list[KnowledgeSource]:
+        """This user's sources, oldest first (Phase 5b: flashcard generation)."""
+        async with self.db.execute(
+            "SELECT * FROM sources WHERE telegram_id = ? ORDER BY id", (telegram_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            KnowledgeSource(
+                id=row["id"],
+                telegram_id=row["telegram_id"],
+                kind=row["kind"],
+                title=row["title"],
+                origin=row["origin"],
+                photo_filename=row["photo_filename"],
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    async def source_text(self, *, telegram_id: int, source_id: int) -> str:
+        """The full text of one of this user's sources, rebuilt from its chunks.
+        Consecutive chunks share one overlap line (tools.rag.chunk_text); it is
+        dropped here so the text reads once. Empty if the source isn't theirs."""
+        async with self.db.execute(
+            "SELECT text FROM chunks WHERE source_id = ? AND telegram_id = ? ORDER BY seq",
+            (source_id, telegram_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        lines: list[str] = []
+        for row in rows:
+            chunk_lines = row["text"].splitlines()
+            if lines and chunk_lines and chunk_lines[0] == lines[-1]:
+                chunk_lines = chunk_lines[1:]
+            lines.extend(chunk_lines)
+        return "\n".join(lines)

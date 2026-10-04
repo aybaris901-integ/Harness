@@ -21,3 +21,7 @@ Pillow>=10.0
 # Needs a Python whose sqlite3 allows extension loading (python.org, Debian/
 # Ubuntu apt, uv builds do; some pyenv builds don't — see README).
 sqlite-vec>=0.1.6
+
+# Phase 5b - flashcards from PDFs. Pure-Python wheel, no native deps (Termux-safe);
+# reads the text layer only — scanned PDFs are detected and pointed at /page.
+pypdf>=5.0

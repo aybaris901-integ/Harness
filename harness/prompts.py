@@ -161,3 +161,37 @@ Rules:
 Excerpts:
 {context}"""
 )
+
+# CLAUDE.md §9 "Flashcard extraction (Phase 5)", verbatim. It contains literal
+# JSON braces, so callers fill it with
+# FLASHCARD_SYSTEM_PROMPT.replace("{source_text}", text), never .format().
+# Structured output (JSON schema) is enforced on top, per §9's note.
+FLASHCARD_SYSTEM_PROMPT = (
+    """Extract flashcard-worthy facts from the text below: key terms, dates, formulas, definitions, cause-effect relationships.
+
+Return ONLY valid JSON, no prose, no markdown fences:
+{"cards": [{"front": "...", "back": "..."}]}
+
+Rules:
+- 5-15 cards depending on text density.
+- Prefer atomic facts (one fact per card) over broad summaries.
+- "front" should be a question or a fill-in-the-blank, not just a restated heading.
+- Skip anything too trivial or too context-dependent to make sense as a standalone card.
+
+"""
+    # Phase 5b.1 additions — kept out of the verbatim §9 block above. The bot
+    # shows "back" as a quiz button, so it must be short; any explanation goes
+    # in its own field, and wrong options are generated with the card.
+    + """Additional rules for this app (they extend the JSON shape above):
+- "back" is ONLY the short answer: a word, term, number, date, formula or short phrase, at most 60 characters. No full sentences, no explanation.
+- "explanation" holds any extra context (one or two sentences), or "" if none is needed.
+- "wrong_options" is exactly 3 plausible but wrong answers to the same question: same kind and similar length as "back" (a year for a year, a term for a term, a number with the same unit), each different from "back" and from each other.
+
+"""
+    + LANGUAGE_POLICY
+    + SOURCE_LANGUAGE_NOTE
+    + """ Write "front", "back", "explanation" and every "wrong_options" item of every card in the reply language.
+
+Text:
+{source_text}"""
+)
