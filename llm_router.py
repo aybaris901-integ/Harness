@@ -7,6 +7,17 @@ rate limits and transient failures move on to the next provider.
 The last link in the default chain is a paid tier (`openrouter-paid`). It is
 only reached once every free provider has failed, and every call to it is
 logged at WARNING with a `[PAID]` marker so spend can be tracked from the logs.
+
+Two more entry points live here for the same reason — feature code never talks
+to a provider directly:
+
+- `build_vision_router`: a separate fallback chain of vision-capable models for
+  handwriting transcription (Phase 5a). It is an ordinary `LLMRouter`; only the
+  provider list differs. Callers must run the PII gate before using it.
+- `Embedder`: text embeddings for the RAG index. No cross-provider fallback on
+  purpose: vectors from different models live in incompatible spaces, so the
+  index is pinned to one model (see storage/knowledge.py) and transient
+  failures are retried against that same model instead.
 """
 
 from __future__ import annotations
@@ -146,7 +157,7 @@ def _build_provider(config: ProviderConfig, settings: Settings) -> LLMProvider:
     if config.name == "gemini":
         return GeminiProvider(**common, thinking_budget=settings.gemini_thinking_budget)
     if config.name == "groq":
-        return GroqProvider(**common)
+        return GroqProvider(**common, reasoning_effort=settings.groq_reasoning_effort)
     if config.name == "openrouter":
         return OpenRouterProvider(**common)
     if config.name == "openrouter-paid":
@@ -172,3 +183,102 @@ def build_router(settings: Settings) -> LLMRouter:
             "paid calls will not be a last resort. Check the chain order."
         )
     return LLMRouter(providers)
+
+
+def build_vision_router(settings: Settings) -> LLMRouter | None:
+    """Vision-capable chain for notebook pages, in `VISION_PROVIDER_CHAIN` order.
+
+    None when no provider in that chain has an API key — callers then fall back
+    to local Tesseract only.
+    """
+    timeout = max(settings.request_timeout, 90.0)  # images upload slower than text
+    providers: list[LLMProvider] = []
+    for name in settings.vision_provider_chain:
+        if name == "gemini" and settings.gemini.api_key:
+            providers.append(
+                GeminiProvider(
+                    api_key=settings.gemini.api_key,
+                    model=settings.gemini_vision_model,
+                    timeout=timeout,
+                    thinking_budget=settings.gemini_thinking_budget,
+                )
+            )
+        elif name == "groq" and settings.groq.api_key:
+            providers.append(
+                GroqProvider(
+                    api_key=settings.groq.api_key,
+                    model=settings.groq_vision_model,
+                    timeout=timeout,
+                    supports_images=True,
+                )
+            )
+        elif name == "openrouter" and settings.openrouter.api_key:
+            providers.append(
+                OpenRouterProvider(
+                    api_key=settings.openrouter.api_key,
+                    model=settings.openrouter_vision_model,
+                    timeout=timeout,
+                    supports_images=True,
+                )
+            )
+    if not providers:
+        return None
+    logger.info("Vision chain: %s", " -> ".join(f"{p.name}({p.model})" for p in providers))
+    return LLMRouter(providers)
+
+
+class EmbeddingError(RuntimeError):
+    """The embedding model could not be reached after retries."""
+
+
+class Embedder:
+    """Document/query embeddings from one pinned model (see module docstring)."""
+
+    def __init__(self, provider: GeminiProvider, *, dimensions: int, retries: int = 3) -> None:
+        self.provider = provider
+        self.dimensions = dimensions
+        self.retries = retries
+
+    @property
+    def model_id(self) -> str:
+        """Stamped into the index; a different value means a reindex is needed."""
+        return f"{self.provider.model}@{self.dimensions}"
+
+    async def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        return await self._embed(texts, "RETRIEVAL_DOCUMENT")
+
+    async def embed_query(self, text: str) -> list[float]:
+        return (await self._embed([text], "RETRIEVAL_QUERY"))[0]
+
+    async def _embed(self, texts: Sequence[str], task_type: str) -> list[list[float]]:
+        if not texts:
+            return []
+        last: Exception | None = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                return await self.provider.embed(
+                    texts, task_type=task_type, output_dimensionality=self.dimensions
+                )
+            except (RateLimitError, ProviderUnavailable) as exc:
+                last = exc
+                logger.warning("embedding attempt %d/%d failed: %s", attempt, self.retries, exc)
+                if attempt < self.retries:
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS * 2**attempt)
+            except ProviderError as exc:
+                raise EmbeddingError(str(exc)) from exc
+        raise EmbeddingError(str(last))
+
+    async def aclose(self) -> None:
+        await self.provider.aclose()
+
+
+def build_embedder(settings: Settings) -> Embedder | None:
+    """None without GEMINI_API_KEY — the knowledge base is then disabled."""
+    if not settings.gemini.api_key:
+        return None
+    provider = GeminiProvider(
+        api_key=settings.gemini.api_key,
+        model=settings.embedding_model,
+        timeout=settings.request_timeout,
+    )
+    return Embedder(provider, dimensions=settings.embedding_dim)

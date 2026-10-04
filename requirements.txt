@@ -15,3 +15,9 @@ cryptography>=43.0
 pytesseract>=0.3.13
 Pillow>=10.0
 # Also requires the Tesseract OCR binary itself (not a pip package) — see README.
+
+# Phase 5a - RAG knowledge base. Prebuilt loadable SQLite extension per
+# platform (Windows/Linux/macOS wheels) — no compiler, no admin rights.
+# Needs a Python whose sqlite3 allows extension loading (python.org, Debian/
+# Ubuntu apt, uv builds do; some pyenv builds don't — see README).
+sqlite-vec>=0.1.6

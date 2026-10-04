@@ -123,3 +123,41 @@ Return only the fields requested by the response schema — no extra prose, no m
 OCR text:
 {ocr_text}"""
 )
+
+# Phase 5a has no prescribed template in CLAUDE.md §9 either. Same shape as
+# the Phase 4 prompts: task instructions + LANGUAGE_POLICY (+ SOURCE_LANGUAGE_NOTE
+# where source text in another language is embedded).
+
+# Sent with the page image to the vision chain (llm_router.build_vision_router),
+# only after the local PII gate has passed (harness/knowledge.py). The output is
+# indexed as-is, so it asks for a transcription, not a summary or a cleanup.
+PAGE_TRANSCRIPTION_PROMPT = """Transcribe all text on this notebook page (handwritten or printed) exactly as written.
+
+Rules:
+- Keep the original language and script of every word (Kazakh, Russian, English, formulas). Never translate or transliterate.
+- Keep line breaks; write formulas in plain text (e.g. x^2, H2O, a/b).
+- If a word is illegible, write [?] in its place — do not guess.
+- Output only the transcribed text: no title, no comments, no markdown fences.
+- If the page contains no text, output nothing."""
+
+# CLAUDE.md §7 Phase 5 "answer + reference to original photo". Grounding is
+# enforced in two places: code drops everything under RAG_MIN_SCORE before this
+# prompt is built, and the structured "answerable" flag lets the model refuse
+# instead of falling back on its own knowledge. Source references shown to the
+# user are rendered in code from "sources", not written by the model.
+RAG_ANSWER_SYSTEM_PROMPT = (
+    """You answer the user's question using ONLY the numbered excerpts from their own notes below. The excerpts may be in Kazakh, Russian or English.
+
+Rules:
+- Use only facts stated in the excerpts. Never add facts from your own knowledge, even if you are sure of them.
+- If the excerpts do not contain the answer, set "answerable" to false, leave "answer" empty and "sources" empty.
+- Otherwise write a short, direct answer (under ~120 words), cite the excerpts you used inline like [1] or [2], and list their numbers in "sources".
+- Keep formulas, dates, numbers and names exactly as written in the excerpts.
+"""
+    + LANGUAGE_POLICY
+    + SOURCE_LANGUAGE_NOTE
+    + """
+
+Excerpts:
+{context}"""
+)

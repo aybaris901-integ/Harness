@@ -97,8 +97,50 @@ def _keyword_regex(keyword: str) -> re.Pattern[str]:
     return re.compile(r"\b" + r"\s+".join(parts) + r"\b", re.IGNORECASE | re.UNICODE)
 
 
+# Shortest stem a Cyrillic keyword may be cut down to by the strict matcher.
+# Russian swaps endings ("паспорт" -> "паспорта"), Kazakh appends suffixes and
+# voices a final consonant ("куәлік" -> "куәлігі"), so some truncation is
+# needed — but never down to a 3-letter stem: `_keyword_regex` turned "көлік"
+# (vehicle) into `көл\w*`, which matched "көлемі" (volume) and "көлі" (lake) on
+# a printed textbook page.
+_STRICT_MIN_STEM = 4
+
+
+def _strict_keyword_regex(keyword: str) -> re.Pattern[str]:
+    """Like `_keyword_regex`, for matching keywords against *document text*
+    (type detection, the PII gate) rather than a user's search query:
+    Cyrillic stems keep at least `_STRICT_MIN_STEM` letters, and ASCII words
+    match whole ("vin" must not match "vinegar")."""
+    parts = []
+    for word in keyword.split():
+        if _CYRILLIC_RE.search(word):
+            if len(word) - 2 >= _STRICT_MIN_STEM + 1:
+                stem = word[:-2]
+            elif len(word) - 1 >= _STRICT_MIN_STEM:
+                stem = word[:-1]
+            else:
+                stem = word
+            parts.append(re.escape(stem) + r"\w*")
+        else:
+            parts.append(re.escape(word) + r"s?")
+    return re.compile(r"\b" + r"\s+".join(parts) + r"\b", re.IGNORECASE | re.UNICODE)
+
+
+# Search patterns: permissive, applied to the user's /find query, where a
+# topic word like "көлік" is exactly what people type.
 _DOCUMENT_TYPE_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     doc_type: tuple(_keyword_regex(kw) for kw in keywords)
+    for doc_type, keywords in DOCUMENT_TYPE_KEYWORDS.items()
+}
+
+# Search-only synonyms: fine in a query, but everyday words in ordinary text
+# ("көлік" = vehicle/transport in physics problems; "nationality" in an
+# English vocabulary lesson), so they never classify a scanned page.
+_SEARCH_ONLY_KEYWORDS = frozenset({"көлік", "nationality"})
+
+# Detection patterns: strict, applied to OCR'd document text.
+_DETECTION_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    doc_type: tuple(_strict_keyword_regex(kw) for kw in keywords if kw not in _SEARCH_ONLY_KEYWORDS)
     for doc_type, keywords in DOCUMENT_TYPE_KEYWORDS.items()
 }
 
@@ -147,7 +189,7 @@ def detect_document_type(text: str) -> str:
     scores = {doc_type: 0 for doc_type in DOCUMENT_TYPE_KEYWORDS}
     for i, line in enumerate(lines):
         in_title = i < _TITLE_LINES
-        for doc_type, patterns in _DOCUMENT_TYPE_PATTERNS.items():
+        for doc_type, patterns in _DETECTION_PATTERNS.items():
             for pattern in patterns:
                 match = pattern.search(line)
                 if not match:
@@ -314,7 +356,8 @@ def _extract_generic(text: str) -> tuple[dict[str, str], str | None]:
     if iin:
         fields["iin"] = iin.group(0)
 
-    vin = _VIN_RE.search(text)
+    # Same plausibility rule as the PII gate: a 17-digit number is not a VIN.
+    vin = next((m for m in _VIN_RE.finditer(text) if _plausible_vin(m.group(0))), None)
     if vin:
         fields["vin"] = vin.group(0)
         type_hint = "vehicle_registration"
@@ -431,6 +474,13 @@ def extract_fields(raw_text: str) -> ExtractedDocument:
 
     document_type = type_hint or detect_document_type(raw_text)
 
+    if document_type == "unknown":
+        # Without a known layout, "label: value" matches are guesses — on a
+        # textbook page they produced junk like "жауабы: СМ". Store no fields;
+        # the encrypted raw OCR text is kept and /find falls back to searching
+        # it (DocumentStore.search).
+        return ExtractedDocument(document_type="unknown", fields={}, raw_text=raw_text)
+
     if document_type == "receipt":
         for key, value in _extract_receipt_fields(raw_text).items():
             fields.setdefault(key, value)
@@ -452,13 +502,67 @@ def needs_local_llm_fallback(extracted: ExtractedDocument) -> bool:
 # staging table.
 _PII_DOCUMENT_TYPES = ("passport", "vehicle_registration")
 
+# The gate's own keyword list, matched with `_strict_keyword_regex` (as type
+# detection is; only /find query scoring stays permissive). The gate runs on
+# every /note and /page photo, i.e. on ordinary study material, so a keyword
+# here must name an identity/vehicle *document*, not a topic:
+#   - "көлік" ("vehicle, transport") is dropped: it is an everyday word in
+#     physics/geography problems, and its 3-letter stem `көл\w*` also matched
+#     "көлемі" (volume) and "көлі" (lake) — the textbook-page false positive.
+#   - "nationality" is dropped: a vocabulary word in English lessons; real
+#     passports are still caught by MRZ and the other ICAO labels.
+_PII_GATE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "passport": (
+        "passport",
+        "паспорт",
+        "төлқұжат",
+        "жеке куәлік",
+        "удостоверение личности",
+        "identity card",
+        "given names",
+        "date of birth",
+        "date of expiry",
+        "signature of bearer",
+    ),
+    "vehicle_registration": (
+        "vehicle registration",
+        "техпаспорт",
+        "тех паспорт",
+        "свидетельство о регистрации",
+        "мемлекеттік тіркеу туралы куәлік",
+        "гос номер",
+        "мемлекеттік нөмір",
+        "vin",
+    ),
+}
+
+_PII_GATE_PATTERNS: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
+    doc_type: tuple((kw, _strict_keyword_regex(kw)) for kw in keywords)
+    for doc_type, keywords in _PII_GATE_KEYWORDS.items()
+}
+
+
+def _plausible_iin(digits: str) -> bool:
+    """A Kazakh IIN starts with a birth date YYMMDD and a 7th digit 1-6
+    (century + sex). Any 12-digit number matched before — a textbook constant
+    or a phone/account number written out would trip the gate. Structural
+    check only, no checksum: an OCR slip in the trailing digits must not let
+    a real IIN through."""
+    month, day, century = int(digits[2:4]), int(digits[4:6]), digits[6]
+    return 1 <= month <= 12 and 1 <= day <= 31 and century in "123456"
+
+
+def _plausible_vin(candidate: str) -> bool:
+    """Real VINs mix letters and digits; a 17-digit number is not a VIN."""
+    return any(c.isalpha() for c in candidate) and any(c.isdigit() for c in candidate)
+
 
 def has_pii_signals(text: str) -> bool:
-    """True if `text` shows any signal `extract_fields` also uses to recognize
-    a passport or vehicle-registration document: an MRZ block, an IIN, a VIN,
-    or an identity/vehicle-document keyword (e.g. "паспорт", "жеке куәлік",
-    "техпаспорт" and their inflected forms — see `_keyword_regex`) anywhere in
-    the text.
+    """True if `text` shows a passport or vehicle-registration signal: an MRZ
+    block, a structurally plausible IIN, a VIN-shaped code mixing letters and
+    digits, or an identity/vehicle-document keyword (e.g. "паспорт", "жеке
+    куәлік", "техпаспорт" and their inflected forms — see `_strict_keyword_regex`)
+    anywhere in the text.
 
     Deliberately more permissive than `detect_document_type`: that function
     only counts a keyword hit in the title region or on a short label-like
@@ -467,15 +571,33 @@ def has_pii_signals(text: str) -> bool:
     opposite bias — it should over-flag, not under-flag — so every keyword
     occurrence counts here, position notwithstanding.
     """
+    return bool(pii_signals(text))
+
+
+def pii_signals(text: str) -> list[tuple[str, str]]:
+    """Every signal `has_pii_signals` would fire on, as (signal name, matched
+    fragment) — for logging which one tripped the gate. Callers log only the
+    names plus this short fragment, never the full text."""
+    fired: list[tuple[str, str]] = []
     if _extract_mrz(text)[1] is not None:
-        return True
-    if _IIN_RE.search(text) or _VIN_RE.search(text):
-        return True
+        fired.append(("mrz", "TD3 line 2"))
+    if iin := next((m for m in _IIN_RE.finditer(text) if _plausible_iin(m.group(0))), None):
+        fired.append(("iin", iin.group(0)))
+    if vin := next((m for m in _VIN_RE.finditer(text) if _plausible_vin(m.group(0))), None):
+        fired.append(("vin", vin.group(0)))
     lowered = text.lower()
-    return any(
-        pattern.search(lowered)
-        for doc_type in _PII_DOCUMENT_TYPES
-        for pattern in _DOCUMENT_TYPE_PATTERNS[doc_type]
+    for doc_type in _PII_DOCUMENT_TYPES:
+        for keyword, pattern in _PII_GATE_PATTERNS[doc_type]:
+            if match := pattern.search(lowered):
+                fired.append((f"keyword:{doc_type}:{keyword}", match.group(0)))
+    return fired
+
+
+def describe_pii_signals(fired: list[tuple[str, str]]) -> str:
+    """Log-safe summary: signal names, plus the matched word for keyword
+    signals only. IIN/VIN/MRZ values are PII themselves and are never logged."""
+    return ", ".join(
+        f"{name}={fragment!r}" if name.startswith("keyword:") else name for name, fragment in fired
     )
 
 
@@ -532,9 +654,7 @@ async def extract_with_local_llm(
 # -- query matching (natural-language search, CLAUDE.md §7 Phase 3) ----------
 
 
-def score_query(
-    query: str, *, document_type: str, field_names: list[str]
-) -> tuple[int, list[str]]:
+def score_query(query: str, *, document_type: str, field_names: list[str]) -> tuple[int, list[str]]:
     """Heuristic keyword match — never an LLM call (CLAUDE.md §5/§8).
 
     Returns (score, matched_field_names); a positive score means the query
@@ -564,3 +684,30 @@ def score_query(
             matched_fields.append(field_name)
 
     return score, matched_fields
+
+
+# Query terms worth matching against raw text: words of 4+ letters (shorter
+# ones are mostly particles/conjunctions — "мен", "и", "the") or 3+ digits.
+_QUERY_TERM_RE = re.compile(r"\b(?:[^\W\d_]{4,}|\d{3,})\b", re.UNICODE)
+_MAX_MATCHED_LINES = 3
+
+
+def score_text(query: str, raw_text: str) -> tuple[int, list[str]]:
+    """Fallback /find scoring over a document's decrypted raw OCR text, for
+    documents with no extracted fields (document_type "unknown").
+
+    Returns (number of distinct query terms found, up to 3 lines that matched).
+    Score is 0 unless at least half of the query's terms are present, so one
+    common word can't pull up an arbitrary document. Inflection-tolerant via
+    `_keyword_regex`, same as the field matching above.
+    """
+    terms = list(dict.fromkeys(term.lower() for term in _QUERY_TERM_RE.findall(query)))
+    if not terms:
+        return 0, []
+    patterns = [_keyword_regex(term) for term in terms]
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    found = [pattern for pattern in patterns if pattern.search(raw_text)]
+    if not found or len(found) * 2 < len(terms):
+        return 0, []
+    matched_lines = [line for line in lines if any(p.search(line) for p in found)]
+    return len(found), matched_lines[:_MAX_MATCHED_LINES]

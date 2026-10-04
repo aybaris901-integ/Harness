@@ -15,7 +15,7 @@ import strings
 from bot.handlers import build_root_router
 from bot.middlewares import AccessMiddleware, UserTrackingMiddleware
 from config import Settings
-from harness import DocumentArchive, Harness, MediaPipeline
+from harness import DocumentArchive, Harness, KnowledgeBase, MediaPipeline
 from storage import Storage
 
 BOT_COMMANDS = [
@@ -23,6 +23,9 @@ BOT_COMMANDS = [
     BotCommand(command="summarize", description=strings.CMD_SUMMARIZE_DESC),
     BotCommand(command="download", description=strings.CMD_DOWNLOAD_DESC),
     BotCommand(command="find", description=strings.CMD_FIND_DESC),
+    BotCommand(command="delete", description=strings.CMD_DELETE_DESC),
+    BotCommand(command="ask", description=strings.CMD_ASK_DESC),
+    BotCommand(command="page", description=strings.CMD_PAGE_DESC),
     BotCommand(command="reset", description=strings.CMD_RESET_DESC),
     BotCommand(command="cancel", description=strings.CMD_CANCEL_DESC),
     BotCommand(command="help", description=strings.CMD_HELP_DESC),
@@ -43,6 +46,7 @@ def create_dispatcher(
     storage: Storage,
     archive: DocumentArchive,
     media: MediaPipeline,
+    knowledge: KnowledgeBase | None,
 ) -> Dispatcher:
     # MemoryStorage: FSM position resets on restart, which is fine — the actual
     # conversation lives in SQLite and is reloaded on the next turn.
@@ -52,6 +56,7 @@ def create_dispatcher(
         settings=settings,
         archive=archive,
         media=media,
+        knowledge=knowledge,
     )
 
     dp.message.outer_middleware(AccessMiddleware(settings))

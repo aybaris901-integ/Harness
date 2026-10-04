@@ -107,6 +107,21 @@ class DocumentArchive:
         except DocumentStorageError as exc:
             raise DocumentError(strings.DOCUMENT_STORAGE_ERROR.format(error=exc)) from exc
 
+    async def delete(self, *, telegram_id: int, document_id: int) -> DocumentRecord | None:
+        """Delete one of this user's documents; None if it isn't theirs / doesn't exist."""
+        try:
+            record = await self.store.delete(telegram_id=telegram_id, document_id=document_id)
+        except DocumentStorageError as exc:
+            raise DocumentError(strings.DOCUMENT_STORAGE_ERROR.format(error=exc)) from exc
+        if record is not None:
+            logger.info(
+                "deleted document %d (%s) for user %s",
+                document_id,
+                record.document_type,
+                telegram_id,
+            )
+        return record
+
     async def load_scan(self, record: DocumentRecord) -> bytes:
         try:
             return await self.store.load_scan(record)

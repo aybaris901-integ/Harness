@@ -20,6 +20,7 @@ from providers.base import (
     LLMProvider,
     ProviderError,
     ProviderUnavailable,
+    UnsupportedFeature,
 )
 
 
@@ -27,7 +28,6 @@ class OpenAICompatibleProvider(LLMProvider):
     """Base for any `/chat/completions` endpoint."""
 
     base_url: str
-    supports_images: bool = False
 
     def __init__(
         self,
@@ -36,9 +36,19 @@ class OpenAICompatibleProvider(LLMProvider):
         model: str,
         timeout: float = 60.0,
         extra_headers: dict[str, str] | None = None,
+        supports_images: bool = False,
+        reasoning_effort: str | None = None,
     ) -> None:
         super().__init__(api_key=api_key, model=model, timeout=timeout)
         self.extra_headers = extra_headers or {}
+        # Set per instance: the same vendor serves text-only and vision models,
+        # and only the vision chain (llm_router.build_vision_router) builds
+        # instances with this on. Images sent to a text-only model are refused
+        # here instead of burning a request on a guaranteed 400.
+        self.supports_images = supports_images
+        # Reasoning models (Groq's gpt-oss) spend hidden reasoning tokens out of
+        # the same max_tokens budget as the answer; "low" keeps that small.
+        self.reasoning_effort = reasoning_effort
 
     def _build_messages(
         self,
@@ -80,6 +90,8 @@ class OpenAICompatibleProvider(LLMProvider):
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> str:
+        if images and not self.supports_images:
+            raise UnsupportedFeature(self.name, f"{self.model} is not configured for images")
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": self._build_messages(
@@ -90,6 +102,8 @@ class OpenAICompatibleProvider(LLMProvider):
             payload["temperature"] = temperature
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         if json_schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -121,9 +135,19 @@ class OpenAICompatibleProvider(LLMProvider):
         text = (choices[0].get("message") or {}).get("content") or ""
         text = text.strip()
         if not text:
-            raise ProviderError(
-                self.name, f"empty response (finish_reason={choices[0].get('finish_reason')})"
-            )
+            finish_reason = choices[0].get("finish_reason")
+            if finish_reason == "length":
+                # The reasoning-model failure mode: hidden reasoning used up
+                # max_tokens before any answer text was emitted.
+                reasoning = ((data.get("usage") or {}).get("completion_tokens_details") or {}).get(
+                    "reasoning_tokens"
+                )
+                raise ProviderError(
+                    self.name,
+                    f"max_tokens exhausted before any answer text (reasoning_tokens={reasoning}); "
+                    "raise max_tokens or lower reasoning_effort",
+                )
+            raise ProviderError(self.name, f"empty response (finish_reason={finish_reason})")
         return text
 
 
@@ -136,7 +160,15 @@ class OpenRouterProvider(OpenAICompatibleProvider):
     name = "openrouter"
     base_url = "https://openrouter.ai/api/v1"
 
-    def __init__(self, *, api_key: str, model: str, timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        timeout: float = 60.0,
+        supports_images: bool = False,
+        reasoning_effort: str | None = None,
+    ) -> None:
         super().__init__(
             api_key=api_key,
             model=model,
@@ -146,6 +178,8 @@ class OpenRouterProvider(OpenAICompatibleProvider):
                 "HTTP-Referer": "https://github.com/local/harness-bot",
                 "X-Title": "Harness Telegram Bot",
             },
+            supports_images=supports_images,
+            reasoning_effort=reasoning_effort,
         )
 
 

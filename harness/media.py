@@ -33,7 +33,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 import strings
 from harness.documents import DocumentArchive, DocumentError
@@ -45,6 +45,9 @@ from tools.downloader import DownloadFailed
 from tools.media_notes import ScreenshotFormatError
 from tools.ocr import OcrError
 from tools.transcriber import resolve_ffmpeg
+
+if TYPE_CHECKING:
+    from harness.knowledge import KnowledgeBase
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +97,7 @@ class MediaPipeline:
         max_download_mb: float = 45.0,
         max_concurrent_downloads: int = 2,
         document_archive: DocumentArchive | None = None,
+        knowledge: KnowledgeBase | None = None,
     ) -> None:
         self.router = router
         self.download_dir = download_dir
@@ -105,6 +109,10 @@ class MediaPipeline:
         # still refuses to save unencrypted in that case, it just can't
         # redirect automatically.
         self.document_archive = document_archive
+        # Phase 5a: a saved note is indexed right away. Best effort — if this
+        # fails the note is still saved, and the startup migration
+        # (KnowledgeBase.migrate_staging_notes) indexes it later.
+        self.knowledge = knowledge
         self.ocr_lang = ocr_lang
         self.ocr_tessdata_dir = ocr_tessdata_dir
         self.max_download_mb = max_download_mb
@@ -226,11 +234,12 @@ class MediaPipeline:
         # document, don't let it reach the unencrypted staging table below —
         # redirect it into the encrypted document archive instead, the same
         # pipeline a plain (uncaptioned) photo would have gone through.
-        if document_fields.has_pii_signals(raw_text):
+        if fired := document_fields.pii_signals(raw_text):
             logger.warning(
-                "user %s sent /note on what looks like a personal document — "
+                "user %s sent /note on what looks like a personal document (%s) — "
                 "redirecting to the encrypted document archive instead of notes",
                 telegram_id,
+                document_fields.describe_pii_signals(fired),
             )
             if self.document_archive is None:
                 raise MediaError(strings.NOTE_PII_NO_ARCHIVE)
@@ -264,6 +273,15 @@ class MediaPipeline:
             telegram_id,
             len(note.tags),
         )
+        if self.knowledge is not None:
+            try:
+                await self.knowledge.index_note(record)
+            except Exception:
+                logger.warning(
+                    "note %d saved but not indexed yet; the next startup migration will retry",
+                    record.id,
+                    exc_info=True,
+                )
         return ScreenshotCapture(redirected_to_documents=False, note=record)
 
     # -- shared -----------------------------------------------------------------

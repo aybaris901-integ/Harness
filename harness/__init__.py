@@ -1,11 +1,16 @@
 """Orchestrator layer."""
 
 from harness.documents import DocumentArchive, DocumentError
+from harness.knowledge import AnswerStatus, KnowledgeAnswer, KnowledgeBase, KnowledgeError
 from harness.links import LinkError, LinkSummarizer, LinkSummary
 from harness.media import MediaDownload, MediaError, MediaPipeline, ScreenshotCapture
 from harness.orchestrator import Harness, HarnessError
 
 __all__ = [
+    "AnswerStatus",
+    "KnowledgeAnswer",
+    "KnowledgeBase",
+    "KnowledgeError",
     "DocumentArchive",
     "DocumentError",
     "Harness",

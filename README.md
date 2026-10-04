@@ -2,8 +2,9 @@
 
 Agent harness over free-tier LLMs. See `CLAUDE.md` for the full spec and roadmap.
 
-**Current status: Phase 4** — tutor + link/video summarizer + document archive +
-generalized media downloader + screenshot notes.
+**Current status: Phase 5a** — tutor + link/video summarizer + document archive +
+generalized media downloader + screenshot notes + RAG knowledge base (`/ask`,
+notebook pages via `/page`). Flashcards/quizzes are Phase 5b, not built yet.
 
 ## Layout
 
@@ -17,6 +18,7 @@ harness/
   links.py           Phase 2 route: article vs video, subtitles vs STT, progress
   documents.py       Phase 3 route: OCR -> field extraction -> encrypted storage -> search
   media.py           Phase 4 route: any-URL download/convert + screenshot OCR -> note staging
+  knowledge.py       Phase 5a route: PII gate -> vision transcription -> embed/index; /ask
   prompts.py         system prompts, verbatim from CLAUDE.md §9 (+ Phase 4's own, see file)
 strings.py           every static, non-LLM user-facing string (CLAUDE.md §8) — Kazakh
 bot/
@@ -25,12 +27,15 @@ bot/
     links.py         URL messages + /summarize; video jobs run in the background
     documents.py     photo uploads + /find; document archive only
     media.py         /download (background job) + photos captioned /note
+    knowledge.py     /ask + photos captioned /page (notebook pages)
   middlewares.py     whitelist gate + user tracking
   states.py          FSM states
 storage/
   db.py              plain SQLite: users + chat history
   documents.py        SEPARATE encrypted SQLite: document fields/OCR text + scan references
-  notes.py           plain SQLite staging table for Phase 4 screenshot notes — no search yet
+  notes.py           plain SQLite staging table for Phase 4 screenshot notes (source for 5a)
+  knowledge.py       sqlite-vec index: sources/chunks/vectors, partitioned per user
+  encrypted_files.py Fernet-encrypted files: document scans + notebook page photos
 tools/               standalone pipelines, no bot/harness imports
   urls.py            URL detection + article/video classification
   article.py         httpx fetch -> trafilatura extraction
@@ -41,6 +46,8 @@ tools/               standalone pipelines, no bot/harness imports
   media_notes.py     Phase 4: media description + screenshot title/tags via llm_router
   language.py        reply-language decision (command word + URLs stripped first)
   ocr.py             local Tesseract OCR — never a cloud vision API (CLAUDE.md §5)
+  vision_ocr.py      handwriting transcription via the vision chain (after the PII gate)
+  rag.py             chunking + grounded answer with structured output
   document_fields.py regex/heuristic field extraction + search-query scoring
 scripts/selfcheck.py local sanity check, no Telegram needed
 ```
@@ -155,6 +162,48 @@ did those. Two optional settings, both with working defaults:
 - `MEDIA_MAX_DOWNLOAD_MB` (default `45`) — `/download` refuses anything over
   this; Telegram bot uploads cap at ~50 MB.
 
+### Phase 5a extras (knowledge base) — one new package, no new keys
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt   # adds sqlite-vec
+```
+
+- **Vector store: `sqlite-vec`.** A prebuilt loadable SQLite extension per
+  platform (pip wheel, no compiler, no admin, no server) on the stdlib sqlite3
+  we already use; Chroma would add onnxruntime/hnswlib and a server-ish stack —
+  the native-build pain we hit with SQLCipher/tessdata. Requirement: a Python
+  whose sqlite3 allows extension loading (python.org Windows builds, Debian/
+  Ubuntu `apt` Python and `uv` Pythons do; some `pyenv` builds don't — the bot
+  refuses to start with a clear message in that case).
+- **Embeddings: `gemini-embedding-2`, 768 dims** (`EMBEDDING_MODEL`,
+  `EMBEDDING_DIM`). Chosen by a retrieval test: 7/7 top-1 on Kazakh→Kazakh and
+  Kazakh→Russian/English questions, with a ~0.17 gap between the weakest
+  correct hit and an off-topic query. Local `multilingual-e5-small` (ONNX) also
+  got 7/7 but with 0.01 margins and a 470 MB download — it is the fallback if
+  notes must never leave the server. The index is pinned to one model: changing
+  either setting needs a rebuild (move `data/knowledge.db` aside; staging notes
+  re-migrate on the next start, page photos would need re-sending).
+- `RAG_MIN_SCORE` (default `0.65`) — below this cosine similarity a chunk is
+  ignored; if nothing passes, `/ask` says so in Kazakh without calling the LLM.
+  `RAG_TOP_K` (default `5`).
+- **Vision chain for handwriting**: `VISION_PROVIDER_CHAIN` (default
+  `gemini,groq,openrouter`), models `GEMINI_VISION_MODEL` (defaults to
+  `GEMINI_MODEL`), `GROQ_VISION_MODEL` (`qwen/qwen3.8-27b`),
+  `OPENROUTER_VISION_MODEL` (`qwen/qwen3.8-27b:free`); Tesseract is the last
+  resort (printed text only).
+- **PII gate**: every `/page` photo is OCR'd **locally** with Tesseract first and
+  checked with `has_pii_signals`; if it fires, the photo goes to the encrypted
+  document archive and never to a cloud vision API. If Tesseract is missing or
+  fails, the page is refused (fails closed).
+- `GROQ_REASONING_EFFORT` (default `low`) — Groq's `gpt-oss` spends hidden
+  reasoning tokens out of `max_tokens`; measured 124-221 at default effort vs
+  23-49 at `low` on the RAG prompt (default effort + `max_tokens=128` → HTTP 400
+  "Failed to validate JSON"). Leave empty for non-reasoning Groq models.
+- `KNOWLEDGE_DB_PATH` (`data/knowledge.db`), `KNOWLEDGE_PAGE_DIR`
+  (`data/knowledge_pages`, Fernet-encrypted photos, same key as documents).
+- Existing `/note` staging rows are migrated into the index on every start
+  (idempotent, in the background); new `/note`s are indexed as they are saved.
+
 ## Run
 
 ```powershell
@@ -229,6 +278,14 @@ or a real LLM call, by the default `scripts\selfcheck.py` run above (see
 .\.venv\Scripts\python.exe scripts\selfcheck.py --screenshot path\to\screenshot.png
 ```
 
+**Phase 5a knowledge base**, real pipeline in a throwaway temp store (local
+Tesseract gate, real vision chain, real embeddings) — prints each retrieved
+chunk with its score and the final answer. Keep test photos outside the repo:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\selfcheck.py --kb page1.jpg page2.jpg --q "Абылай хан қай жылы хан сайланды?" --q "Ом заңының формуласы қандай?"
+```
+
 **In Telegram**, after `python main.py`:
 
 | You send | Expected |
@@ -248,10 +305,16 @@ or a real LLM call, by the default `scripts\selfcheck.py` run above (see
 | a photo of a document (passport, vehicle registration, contract, receipt) | "⏳ Құжатты өңдеп жатырмын…" then ✅ with the detected document type + extracted fields |
 | `/find <query>` (e.g. `/find көлік нөмірі`) | best-matching stored document's fields, then the original scan photo |
 | `/find` with no match | "no matching document" reply |
+| `/find <words from the text>` on a document stored as "unknown" | found via its encrypted OCR text: matching lines + the scan (unknown documents store no guessed fields) |
+| `/delete <id>` (id shown as `#N` when saved and in `/find`) | 🗑 document and its encrypted scan removed; another user's id behaves like a missing one |
 | `/download <url>` | "⏳ processing…" placeholder, then an inline-playable mp4 video (H.264/AAC, highest resolution under `MEDIA_MAX_DOWNLOAD_MB`) with a Kazakh LLM description as the caption |
 | `/download <url> mp3` | same, but audio-only, converted to mp3 (needs ffmpeg) |
 | a photo captioned `/note` | "⏳ processing…" placeholder, then 📝 bold title, #tags, and the OCR'd text verbatim (the LLM only writes title + tags) |
 | `/note` with no photo | usage reminder: caption a photo with `/note` |
+| a notebook-page photo captioned `/page` (optional title after it) | "⏳ Дәптер бетін оқып жатырмын…" then 📚 added, with title + chunk count |
+| a passport photo captioned `/page` | ⚠️ redirected to the encrypted document archive, never sent to a vision API |
+| `/ask <question>` | Kazakh answer with [n] citations, 📎 source line(s), then the original page photo if it came from a page |
+| `/ask` about something not in your notes | static Kazakh "nothing found in your notes" — no answer from model knowledge |
 | a voice message or a non-image file | "text, links and document photos only" |
 
 Replies follow the CLAUDE.md language policy: Kazakh by default, English if
@@ -340,6 +403,5 @@ Telegram command menu) via `strings.py`, not just LLM output (CLAUDE.md §8).
   still goes to the Phase 3 PII pipeline unchanged — default photo behavior
   did not change.
 - **The staging table has no search on purpose** (CLAUDE.md §7 Phase 4) —
-  `storage/notes.py` only saves and counts. Phase 5's vector store is meant to
-  migrate from `content_json` in that table once it exists; nothing here
-  should grow ad-hoc search before then.
+  `storage/notes.py` only saves, counts and (Phase 5a) iterates for the
+  one-way migration. Search happens in the knowledge index, never here.

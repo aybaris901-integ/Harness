@@ -34,8 +34,8 @@ from bot.formatting import (
     render_chunks,
     to_plain,
 )
+from bot.handlers.documents import format_document_saved
 from harness.media import MediaDownload, MediaError, MediaPipeline
-from storage.documents import DocumentRecord
 from tools.urls import extract_urls
 
 logger = logging.getLogger(__name__)
@@ -58,17 +58,6 @@ class HasNoteCaption(BaseFilter):
             return False
         caption = (message.caption or "").strip().lower()
         return caption == "/note" or caption.startswith("/note ")
-
-
-def _format_document_saved(record: DocumentRecord) -> str:
-    # Mirrors bot/handlers/documents.py's _format_saved — kept as its own
-    # small copy rather than importing a private helper across handler
-    # modules for what's meant to be a rare redirect path.
-    doc_type = strings.DOCUMENT_TYPE_LABELS.get(record.document_type, record.document_type)
-    header = strings.DOCUMENT_SAVED.format(type=doc_type, count=len(record.fields))
-    lines = [header]
-    lines.extend(f"• {name}: {value}" for name, value in record.fields.items())
-    return "\n".join(lines)
 
 
 async def _finish(bot: Bot, status: Message, text: str) -> None:
@@ -212,7 +201,7 @@ async def handle_note_photo(message: Message, media: MediaPipeline) -> None:
     if result.redirected_to_documents:
         assert result.document is not None
         await status.edit_text(strings.NOTE_PII_REDIRECTED)
-        await message.answer(_format_document_saved(result.document))
+        await message.answer(format_document_saved(result.document))
         return
 
     assert result.note is not None

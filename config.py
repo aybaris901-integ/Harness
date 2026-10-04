@@ -131,6 +131,18 @@ class Settings:
     notes_db_path: Path
     media_max_download_mb: float
     media_max_concurrent: int
+    # --- Phase 5a: RAG knowledge base ---
+    groq_reasoning_effort: str | None
+    knowledge_db_path: Path
+    knowledge_page_dir: Path
+    embedding_model: str
+    embedding_dim: int
+    rag_top_k: int
+    rag_min_score: float
+    vision_provider_chain: tuple[str, ...]
+    gemini_vision_model: str
+    groq_vision_model: str
+    openrouter_vision_model: str
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -166,6 +178,27 @@ class Settings:
         notes_db_path = Path(_get("NOTES_DB_PATH", "data/notes.db") or "data/notes.db")
         if not notes_db_path.is_absolute():
             notes_db_path = BASE_DIR / notes_db_path
+        knowledge_db_path = Path(
+            _get("KNOWLEDGE_DB_PATH", "data/knowledge.db") or "data/knowledge.db"
+        )
+        if not knowledge_db_path.is_absolute():
+            knowledge_db_path = BASE_DIR / knowledge_db_path
+        knowledge_page_dir = Path(
+            _get("KNOWLEDGE_PAGE_DIR", "data/knowledge_pages") or "data/knowledge_pages"
+        )
+        if not knowledge_page_dir.is_absolute():
+            knowledge_page_dir = BASE_DIR / knowledge_page_dir
+
+        vision_chain = _get_csv("VISION_PROVIDER_CHAIN", "gemini,groq,openrouter")
+        unknown_vision = set(vision_chain) - {"gemini", "groq", "openrouter"}
+        if unknown_vision:
+            raise ConfigError(
+                f"VISION_PROVIDER_CHAIN contains unknown providers: "
+                f"{', '.join(sorted(unknown_vision))}. Known: gemini, groq, openrouter."
+            )
+        rag_min_score = _get_float("RAG_MIN_SCORE", 0.65)
+        if not 0.0 < rag_min_score < 1.0:
+            raise ConfigError(f"RAG_MIN_SCORE must be between 0 and 1, got {rag_min_score}")
 
         # CLAUDE.md §5: this key encrypts document scans + PII at rest. It must
         # come from .env, never be generated silently, and never be logged.
@@ -217,9 +250,7 @@ class Settings:
                     or "google/gemini-3.8-flash"
                 ),
             ),
-            provider_chain=_get_csv(
-                "LLM_PROVIDER_CHAIN", "gemini,groq,openrouter,openrouter-paid"
-            ),
+            provider_chain=_get_csv("LLM_PROVIDER_CHAIN", "gemini,groq,openrouter,openrouter-paid"),
             gemini_thinking_budget=_get_optional_int("GEMINI_THINKING_BUDGET"),
             db_path=db_path,
             history_limit=_get_int("HISTORY_LIMIT", 20),
@@ -249,6 +280,25 @@ class Settings:
             notes_db_path=notes_db_path,
             media_max_download_mb=_get_float("MEDIA_MAX_DOWNLOAD_MB", 45.0),
             media_max_concurrent=_get_int("MEDIA_MAX_CONCURRENT", 2),
+            # "low" by default: gpt-oss reasoning tokens count against
+            # max_tokens; empty value disables the field for non-reasoning models.
+            groq_reasoning_effort=_get("GROQ_REASONING_EFFORT", "low"),
+            knowledge_db_path=knowledge_db_path,
+            knowledge_page_dir=knowledge_page_dir,
+            # Chosen by the Phase 5a retrieval test (kk->kk and kk->ru/en
+            # cross-lingual, 7/7 top-1). Changing model or dim needs a reindex:
+            # the knowledge store refuses to mix vectors from different models.
+            embedding_model=_get("EMBEDDING_MODEL", "gemini-embedding-2") or "gemini-embedding-2",
+            embedding_dim=_get_int("EMBEDDING_DIM", 768),
+            rag_top_k=_get_int("RAG_TOP_K", 5),
+            rag_min_score=rag_min_score,
+            vision_provider_chain=vision_chain,
+            gemini_vision_model=_get("GEMINI_VISION_MODEL")
+            or (_get("GEMINI_MODEL", "gemini-2.5-flash") or "gemini-2.5-flash"),
+            groq_vision_model=_get("GROQ_VISION_MODEL", "qwen/qwen3.8-27b") or "qwen/qwen3.8-27b",
+            openrouter_vision_model=(
+                _get("OPENROUTER_VISION_MODEL", "qwen/qwen3.8-27b:free") or "qwen/qwen3.8-27b:free"
+            ),
         )
 
         known = set(settings._providers_by_name())

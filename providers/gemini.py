@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
+# batchEmbedContents accepts at most 100 requests per call.
+_EMBED_BATCH_LIMIT = 100
+
 # Keys that JSON Schema allows but Gemini's responseSchema rejects.
 _SCHEMA_DROP_KEYS = frozenset(
     {"$schema", "$id", "additionalProperties", "definitions", "$defs", "default", "examples"}
@@ -139,6 +142,53 @@ class GeminiProvider(LLMProvider):
 
         self._raise_for_status(response)
         return self._extract_text(response.json())
+
+    async def embed(
+        self, texts: Sequence[str], *, task_type: str, output_dimensionality: int
+    ) -> list[list[float]]:
+        """Embed `texts` with this provider's (embedding) model, one vector each.
+
+        `task_type` is RETRIEVAL_DOCUMENT for indexed chunks and RETRIEVAL_QUERY
+        for questions — the asymmetric pair the retrieval test was run with.
+        """
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), _EMBED_BATCH_LIMIT):
+            batch = texts[start : start + _EMBED_BATCH_LIMIT]
+            payload = {
+                "requests": [
+                    {
+                        "model": f"models/{self.model}",
+                        "content": {"parts": [{"text": text}]},
+                        "taskType": task_type,
+                        "outputDimensionality": output_dimensionality,
+                    }
+                    for text in batch
+                ]
+            }
+            url = f"{API_BASE}/models/{self.model}:batchEmbedContents"
+            try:
+                response = await self.client.post(
+                    url,
+                    headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+                    json=payload,
+                )
+            except httpx.HTTPError as exc:
+                raise ProviderUnavailable(self.name, f"request failed: {exc}") from exc
+            self._raise_for_status(response)
+            embeddings = response.json().get("embeddings") or []
+            if len(embeddings) != len(batch):
+                raise ProviderError(
+                    self.name, f"expected {len(batch)} embeddings, got {len(embeddings)}"
+                )
+            for item in embeddings:
+                values = item.get("values") or []
+                if len(values) != output_dimensionality:
+                    raise ProviderError(
+                        self.name,
+                        f"embedding has {len(values)} dims, expected {output_dimensionality}",
+                    )
+                vectors.append([float(v) for v in values])
+        return vectors
 
     def _extract_text(self, data: dict[str, Any]) -> str:
         candidates = data.get("candidates") or []

@@ -7,6 +7,11 @@ NOT a search index: Phase 5's vector store is what will make these notes
 actually queryable. Until Phase 5 exists, this only exists so a formatted note
 isn't lost between now and then — no search/query method is provided here on
 purpose (CLAUDE.md §7 Phase 4: "Don't build ad-hoc search for it now").
+
+Phase 5a: `iter_notes` exists only for the one-way migration into the
+knowledge index (harness/knowledge.py). Searching still happens in the vector
+store, never here. The table stays as the source of truth the index can be
+rebuilt from.
 """
 
 from __future__ import annotations
@@ -111,3 +116,22 @@ class NoteStore:
         ) as cursor:
             row = await cursor.fetchone()
         return int(row["n"]) if row else 0
+
+    async def iter_notes(self, *, after_id: int = 0, limit: int = 100) -> list[NoteRecord]:
+        """All users' notes with id > `after_id`, oldest first — migration only."""
+        async with self.db.execute(
+            "SELECT * FROM notes WHERE id > ? ORDER BY id LIMIT ?", (after_id, limit)
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            NoteRecord(
+                id=row["id"],
+                telegram_id=row["telegram_id"],
+                kind=row["kind"],
+                title=row["title"],
+                content_md=row["content_md"],
+                content_json=row["content_json"],
+                tags=[tag for tag in row["tags"].split(",") if tag],
+            )
+            for row in rows
+        ]

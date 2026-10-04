@@ -3,7 +3,10 @@
 Any photo lands here — OCR and field extraction run entirely locally (§5),
 and the scan plus extracted fields are stored encrypted, keyed per Telegram
 user. `/find <query>` searches that store and returns the best match:
-extracted fields plus the original scan.
+extracted fields (or, for an "unknown" document with no fields, the matching
+lines of its OCR text) plus the original scan. `/delete <id>` removes one of
+the user's own documents — the PII redirects from /note and /page can land a
+false positive here.
 """
 
 from __future__ import annotations
@@ -27,20 +30,33 @@ def _type_label(document_type: str) -> str:
     return strings.DOCUMENT_TYPE_LABELS.get(document_type, document_type)
 
 
-def _format_saved(record: DocumentRecord) -> str:
-    header = strings.DOCUMENT_SAVED.format(
-        type=_type_label(record.document_type), count=len(record.fields)
-    )
-    lines = [header]
-    lines.extend(f"• {name}: {value}" for name, value in record.fields.items())
+def format_document_saved(record: DocumentRecord) -> str:
+    """Shared by every handler that may store a photo in the archive (/note, /page).
+    Always ends with the /delete hint: the PII redirects can land a false
+    positive here, and the id is the only handle the user has on it."""
+    doc_type = _type_label(record.document_type)
+    if record.fields:
+        lines = [
+            strings.DOCUMENT_SAVED.format(id=record.id, type=doc_type, count=len(record.fields))
+        ]
+        lines.extend(f"• {name}: {value}" for name, value in record.fields.items())
+    else:
+        lines = [strings.DOCUMENT_SAVED_TEXT_ONLY.format(id=record.id, type=doc_type)]
+    lines.append(strings.DOCUMENT_DELETE_HINT.format(id=record.id))
     return "\n".join(lines)
 
 
 def _format_match(match: DocumentMatch) -> str:
-    lines = [strings.DOCUMENT_MATCH_HEADER.format(type=_type_label(match.record.document_type))]
-    for name, value in match.record.fields.items():
+    record = match.record
+    lines = [
+        strings.DOCUMENT_MATCH_HEADER.format(id=record.id, type=_type_label(record.document_type))
+    ]
+    for name, value in record.fields.items():
         marker = "➡️ " if name in match.matched_fields else "• "
         lines.append(f"{marker}{name}: {value}")
+    if match.matched_lines:
+        lines.append(strings.DOCUMENT_MATCH_TEXT_LINES)
+        lines.extend(f"➡️ {line}" for line in match.matched_lines)
     return "\n".join(lines)
 
 
@@ -65,7 +81,7 @@ async def handle_photo(message: Message, archive: DocumentArchive) -> None:
         await status.edit_text(strings.DOCUMENT_GENERIC_ERROR)
         return
 
-    await status.edit_text(_format_saved(record))
+    await status.edit_text(format_document_saved(record))
 
 
 @router.message(Command("find"))
@@ -98,4 +114,34 @@ async def handle_find(message: Message, command: CommandObject, archive: Documen
         return
     await message.answer_photo(
         BufferedInputFile(scan_bytes, filename=f"{match.record.document_type}.jpg")
+    )
+
+
+@router.message(Command("delete"))
+async def handle_delete(message: Message, command: CommandObject, archive: DocumentArchive) -> None:
+    """`/delete <id>` — remove one of the sender's own archived documents (row
+    + encrypted scan). Scoped by Telegram user id in the store's SQL, so an id
+    belonging to someone else behaves exactly like a missing one."""
+    assert message.from_user is not None
+    raw = (command.args or "").strip().lstrip("#")
+    if not raw.isdigit():
+        await message.answer(strings.DOCUMENT_DELETE_USAGE)
+        return
+    document_id = int(raw)
+
+    try:
+        record = await archive.delete(telegram_id=message.from_user.id, document_id=document_id)
+    except DocumentError as exc:
+        await message.answer(str(exc))
+        return
+    except Exception:
+        logger.exception("Unexpected failure deleting a document")
+        await message.answer(strings.DOCUMENT_GENERIC_ERROR)
+        return
+
+    if record is None:
+        await message.answer(strings.DOCUMENT_DELETE_NOT_FOUND.format(id=document_id))
+        return
+    await message.answer(
+        strings.DOCUMENT_DELETED.format(id=document_id, type=_type_label(record.document_type))
     )

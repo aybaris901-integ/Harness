@@ -13,6 +13,7 @@ dependencies = [
     "cryptography>=43.0",
     "pytesseract>=0.3.13",
     "Pillow>=10.0",
+    "sqlite-vec>=0.1.6",
 ]
 
 [project.optional-dependencies]

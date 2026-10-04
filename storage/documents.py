@@ -7,6 +7,7 @@ with Fernet (AES-128-CBC + HMAC-SHA256, authenticated) using a key that comes
 from `Settings` / `.env` and is never logged:
 
 - the scanned image, as a standalone `<uuid>.enc` file under `scan_dir`
+  (via `storage.encrypted_files`, shared with the Phase 5a knowledge base)
 - the extracted field values and the raw OCR text, as BLOB columns
 
 `document_type` and the set of field *names* (not values) are stored in the
@@ -17,17 +18,16 @@ another user's — or an unmatched document's — PII to do it.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiosqlite
 from cryptography.fernet import Fernet, InvalidToken
 
-from tools.document_fields import score_query
+from storage.encrypted_files import EncryptedFileError, EncryptedFileStore
+from tools.document_fields import score_query, score_text
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,9 @@ class DocumentMatch:
     record: DocumentRecord
     matched_fields: list[str]
     score: int
+    # Set only by the raw-text fallback (documents with no fields): the OCR
+    # lines that matched the query, shown instead of field values.
+    matched_lines: list[str] = field(default_factory=list)
 
 
 class DocumentStore:
@@ -75,6 +78,7 @@ class DocumentStore:
         self.db_path = db_path
         self.scan_dir = scan_dir
         self._fernet = Fernet(encryption_key)
+        self._scans = EncryptedFileStore(scan_dir, encryption_key)
         self._db: aiosqlite.Connection | None = None
 
     @property
@@ -85,7 +89,7 @@ class DocumentStore:
 
     async def connect(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.scan_dir.mkdir(parents=True, exist_ok=True)
+        self._scans.ensure_dir()
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
@@ -109,10 +113,8 @@ class DocumentStore:
         raw_text: str,
         image_bytes: bytes,
     ) -> DocumentRecord:
-        scan_filename = f"{uuid.uuid4().hex}.enc"
-        scan_path = self.scan_dir / scan_filename
-        encrypted_image = self._fernet.encrypt(image_bytes)
-        await asyncio.to_thread(scan_path.write_bytes, encrypted_image)
+        scan_filename = await self._scans.write(image_bytes)
+        scan_path = self._scans.path_for(scan_filename)
 
         fields_enc = self._fernet.encrypt(json.dumps(fields, ensure_ascii=False).encode("utf-8"))
         raw_text_enc = self._fernet.encrypt(raw_text.encode("utf-8"))
@@ -163,10 +165,53 @@ class DocumentStore:
                 best = (score, row["id"], matched_fields)
 
         if best is None:
-            return None
+            return await self._search_raw_text(telegram_id=telegram_id, query=query)
         score, doc_id, matched_fields = best
         record = await self._load(doc_id)
         return DocumentMatch(record=record, matched_fields=matched_fields, score=score)
+
+    async def _search_raw_text(self, *, telegram_id: int, query: str) -> DocumentMatch | None:
+        """Fallback for documents with no extracted fields (type "unknown"):
+        decrypt this user's unknown documents' OCR text, in-process only, and
+        match the query against it. Never touches another user's rows, and
+        never decrypts a typed document's text — those are found by fields."""
+        async with self.db.execute(
+            "SELECT * FROM documents WHERE telegram_id = ? AND document_type = 'unknown' "
+            "ORDER BY id DESC",
+            (telegram_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        best: tuple[int, DocumentRecord, list[str]] | None = None
+        for row in rows:
+            record = self._decrypt_row(row)
+            score, lines = score_text(query, record.raw_text)
+            if score > 0 and (best is None or score > best[0]):
+                best = (score, record, lines)
+        if best is None:
+            return None
+        score, record, lines = best
+        return DocumentMatch(record=record, matched_fields=[], score=score, matched_lines=lines)
+
+    async def delete(self, *, telegram_id: int, document_id: int) -> DocumentRecord | None:
+        """Delete one of this user's documents (row + encrypted scan). Returns
+        the deleted record, or None if no such document belongs to this user."""
+        async with self.db.execute(
+            "SELECT * FROM documents WHERE id = ? AND telegram_id = ?", (document_id, telegram_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        record = self._decrypt_row(row)
+        await self.db.execute(
+            "DELETE FROM documents WHERE id = ? AND telegram_id = ?", (document_id, telegram_id)
+        )
+        await self.db.commit()
+        # Row first, file second: a crash in between leaves an orphaned
+        # encrypted file (unreadable without the row), never a row whose scan
+        # is gone.
+        await self._scans.delete(record.scan_path.name)
+        return record
 
     async def _load(self, document_id: int) -> DocumentRecord:
         async with self.db.execute(
@@ -195,10 +240,9 @@ class DocumentStore:
         )
 
     async def load_scan(self, record: DocumentRecord) -> bytes:
-        encrypted = await asyncio.to_thread(record.scan_path.read_bytes)
         try:
-            return self._fernet.decrypt(encrypted)
-        except InvalidToken as exc:
+            return await self._scans.read(record.scan_path.name)
+        except EncryptedFileError as exc:
             raise DocumentStorageError(
-                f"could not decrypt scan for document {record.id} — wrong DOCUMENTS_ENCRYPTION_KEY?"
+                f"could not decrypt scan for document {record.id}: {exc}"
             ) from exc

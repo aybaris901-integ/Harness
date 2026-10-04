@@ -216,6 +216,122 @@ N000000015KAZ9001010F3001010990101300123<<00
 """
 
 
+# SYNTHETIC study-material samples (written for these checks, not copied from
+# any textbook) with the shape of the /page false positive: problem labels
+# (Берілгені / Табу керек / Шешуі / Жауабы), formulas, units, long numbers, and
+# everyday words whose stems used to collide with gate keywords ("көлемі" =
+# volume matched the vehicle keyword "көлік").
+SYNTHETIC_TEXTBOOK_PAGES = {
+    "kk chemistry worksheet": """
+§12. Газдардың молярлық көлемі
+7-есеп. Қалыпты жағдайда 4,4 г CO2 қандай көлем алады?
+Берілгені: m(CO2) = 4,4 г
+M(CO2) = 44 г/моль
+Табу керек: V(CO2) - ?
+Шешуі: n = m / M = 4,4 / 44 = 0,1 моль
+V = n · Vm = 0,1 · 22,4 = 2,24 л
+Жауабы: 2,24 л
+8-есеп. C6H12O6 + 6O2 -> 6CO2 + 6H2O реакциясындағы оттектің көлемін есепте.
+Жауабы: C,H,O; 134,4 л
+""",
+    "kk geography + physics": """
+Балқаш көлі — Қазақстандағы ірі көлдердің бірі, ауданы 16 400 км².
+Көлдің көлемі шамамен 112 км³.
+Көліктің жылдамдығы v = 72 км/сағ = 20 м/с. Табу керек: t - ?
+Жауабы: t = s / v = 1200 / 20 = 60 с
+""",
+    "ru physics worksheet": """
+Задача 3. Определите объём тела массой 2,7 кг, если плотность 2700 кг/м³.
+Дано: m = 2,7 кг; ρ = 2700 кг/м³
+Найти: V - ?
+Решение: V = m / ρ = 0,001 м³
+Ответ: 0,001 м³ = 1 дм³
+Постоянная Авогадро: 602214076000000000000000 (≈ 6,02·10²³ моль⁻¹)
+""",
+    "en chemistry + vocabulary": """
+Vinegar is a 5% solution of acetic acid, CH3COOH. Vinyl chloride: C2H3Cl.
+Vocabulary: nationality, citizen, identity, register (verb).
+Exercise 4: 123456789012 + 987654321098 = 1111111110110
+Answer: 12345678901234567 is a 17-digit number.
+""",
+}
+
+# SYNTHETIC Kaspi-style transfer receipt (fake names/numbers) — classification
+# must stay "receipt" after the gate/extraction changes.
+SAMPLE_RECEIPT_OCR = """
+Перевод успешно совершен
+5 000 ₸
+№ квитанции
+Отправитель
+Получатель
+4012345678901
+Тестов А.
+Примеров Б.
+"""
+
+
+def pii_gate_regression_checks() -> None:
+    """Phase 5a regression: the /page false positive on a printed textbook page."""
+    print("\nPII gate: study material is NOT flagged (synthetic samples):")
+    for label, text in SYNTHETIC_TEXTBOOK_PAGES.items():
+        fired = document_fields.pii_signals(text)
+        check(
+            f"{label}: no signal ({document_fields.describe_pii_signals(fired) or 'clear'})",
+            not fired,
+        )
+
+    print("\nPII gate: real-document samples still flagged:")
+    for label, text in (
+        ("passport (title keyword + IIN)", SAMPLE_PASSPORT_OCR),
+        ("garbled passport (MRZ only)", SAMPLE_GARBLED_PASSPORT_OCR),
+        ("vehicle registration (VIN)", SAMPLE_VEHICLE_OCR),
+        ("Russian inflection: «серия паспорта»", "Серия паспорта: N0000001"),
+        ("Kazakh inflection: «жеке куәлігі»", "Менің жеке куәлігім жоғалды"),
+        ("vehicle cert heading only", "ТЕХПАСПОРТ\nМарка: Test"),
+        ("Kazakh state plate label", "Мемлекеттік нөмірі: 123 ABC 02"),
+        ("handwritten IIN line", "ЖСН: 900101300123"),
+        ("bare VIN line", "VIN: 1HGCM82633A004352"),
+    ):
+        fired = document_fields.pii_signals(text)
+        check(f"{label}: {document_fields.describe_pii_signals(fired)}", bool(fired))
+    check(
+        "logged summary never contains the IIN/VIN value itself",
+        "900101300123"
+        not in document_fields.describe_pii_signals(
+            document_fields.pii_signals(SAMPLE_PASSPORT_OCR)
+        ),
+    )
+
+    print("\nDocument type of samples unchanged:")
+    check(
+        "receipt sample still classified as receipt",
+        document_fields.extract_fields(SAMPLE_RECEIPT_OCR).document_type == "receipt",
+    )
+    check(
+        "receipt fields unchanged (receipt number + sender)",
+        # Same output as before this change (verified against HEAD). "amount"
+        # is not extracted from "5 000 ₸" — a pre-existing _AMOUNT_RE issue,
+        # out of scope here.
+        {
+            k: v
+            for k, v in document_fields.extract_fields(SAMPLE_RECEIPT_OCR).fields.items()
+            if k in ("receipt_number", "sender")
+        }
+        == {"receipt_number": "4012345678901", "sender": "Тестов А."},
+    )
+
+    print("\nStudy material is not classified as a document type:")
+    for label, text in SYNTHETIC_TEXTBOOK_PAGES.items():
+        doc_type = document_fields.extract_fields(text).document_type
+        check(f"{label}: {doc_type}", doc_type == "unknown")
+
+    print("\nUnknown documents keep no guessed fields:")
+    worksheet = document_fields.extract_fields(SYNTHETIC_TEXTBOOK_PAGES["kk chemistry worksheet"])
+    check("worksheet classified as unknown", worksheet.document_type == "unknown")
+    check("... with no 'label: value' junk fields", worksheet.fields == {})
+    check("... raw OCR text kept for /find", "Берілгені" in worksheet.raw_text)
+
+
 def phase3_offline_checks() -> None:
     """Regex/heuristic extraction — no Tesseract, no LLM (CLAUDE.md §5/§9)."""
     print("\nDocument field extraction:")
@@ -529,15 +645,35 @@ async def routing_offline_checks() -> None:
     class FakeArchive:
         def __init__(self) -> None:
             self.queries: list[str] = []
+            self.deleted: list[tuple[int, int]] = []
 
         async def search(self, *, telegram_id, query):
             self.queries.append(query)
             return None
 
+        async def delete(self, *, telegram_id, document_id):
+            self.deleted.append((telegram_id, document_id))
+            return None  # "not found" path; the store-level checks cover real deletion
+
     session = RecordingSession()
     fake_bot = Bot(token="42:offline-selfcheck", session=session)
+    from harness.knowledge import AnswerStatus, KnowledgeAnswer
+    from storage.knowledge import KnowledgeSource
+
+    class FakeKnowledge:
+        def __init__(self) -> None:
+            self.asked: list[tuple[int, str, str]] = []
+            self.next = KnowledgeAnswer(status=AnswerStatus.NOTHING_RELEVANT)
+
+        async def ask(self, *, telegram_id, question, user_message):
+            self.asked.append((telegram_id, question, user_message))
+            return self.next
+
     media, harness, archive = FakeMedia(), FakeHarness(), FakeArchive()
-    dp = Dispatcher(harness=harness, media=media, archive=archive, settings=None)
+    knowledge = FakeKnowledge()
+    dp = Dispatcher(
+        harness=harness, media=media, archive=archive, knowledge=knowledge, settings=None
+    )
     dp.include_router(build_root_router())
 
     update_id = 0
@@ -612,6 +748,66 @@ async def routing_offline_checks() -> None:
         any(a.parse_mode == "HTML" and "<b>Summary</b>" in a.text for a in answers),
     )
     check("/find and plain URLs triggered no download", len(media.calls) == 3)
+
+    print("\nRouting (Phase 5a /ask):")
+    import strings
+
+    await send("/ask фотосинтез қайда өтеді?")
+    check("'/ask <q>' reached the knowledge handler", len(knowledge.asked) == 1)
+    check(
+        "... question passed without the command",
+        knowledge.asked[0][1] == "фотосинтез қайда өтеді?",
+    )
+    check("... scoped to the sender's user id", knowledge.asked[0][0] == 1)
+    check(
+        "nothing above threshold -> static Kazakh notice, no answer text",
+        [m.text for m in sent("SendMessage")] == [strings.KB_NOTHING_RELEVANT],
+    )
+    knowledge.next = KnowledgeAnswer(status=AnswerStatus.NOT_IN_NOTES)
+    await send("/ask Кальвин циклі")
+    check(
+        "not in notes -> static Kazakh notice",
+        [m.text for m in sent("SendMessage")] == [strings.KB_NOT_IN_NOTES],
+    )
+
+    page = KnowledgeSource(
+        id=7, telegram_id=1, kind="page", title="Биология <9>", origin=None,
+        photo_filename="x.enc", created_at="2026-10-04 08:00:00",
+    )  # fmt: skip
+    knowledge.next = KnowledgeAnswer(
+        status=AnswerStatus.ANSWERED,
+        answer="Жарық фазасы **тилакоид** мембранасында өтеді [1].",
+        sources=[page],
+        photo=b"jpeg",
+        photo_source=page,
+    )
+    await send("/ask фотосинтез")
+    answer = sent("SendMessage")[0]
+    check("answer sent as HTML", answer.parse_mode == "HTML" and "<b>тилакоид</b>" in answer.text)
+    check(
+        "source reference rendered in code",
+        strings.KB_SOURCES_HEADER in answer.text and "2026-10-04" in answer.text,
+    )
+    check("source title HTML-escaped", "Биология &lt;9&gt;" in answer.text)
+    check("original page photo sent after the answer", len(sent("SendPhoto")) == 1)
+
+    await send("/ask")
+    check("'/ask' alone -> usage", [m.text for m in sent("SendMessage")] == [strings.KB_ASK_USAGE])
+    await send("/page")
+    check(
+        "'/page' without a photo -> usage",
+        [m.text for m in sent("SendMessage")] == [strings.KB_PAGE_USAGE],
+    )
+
+    print("\nRouting (/delete):")
+    await send("/delete #8")
+    check("'/delete #8' reached the archive, scoped to the sender", archive.deleted == [(1, 8)])
+    check(
+        "unknown id -> not-found notice",
+        [m.text for m in sent("SendMessage")] == [strings.DOCUMENT_DELETE_NOT_FOUND.format(id=8)],
+    )
+    await send("/delete abc")
+    check("non-numeric id -> usage, nothing deleted", len(archive.deleted) == 1)
 
     await fake_bot.session.close()
 
@@ -703,6 +899,596 @@ def download_format_offline_checks() -> None:
         "with no cap the best H.264 wins over VP9",
         [f["format_id"] for f in unlimited["requested_formats"]] == ["137", "140"],
     )
+
+
+class HashEmbedder:
+    """Deterministic offline stand-in for llm_router.Embedder: hashed
+    bag-of-words, L2-normalized. Same words -> high cosine; disjoint -> ~0."""
+
+    dimensions = 64
+    model_id = "hash-stub@64"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def _vector(self, text: str) -> list[float]:
+        import hashlib
+        import math
+        import re
+
+        vector = [0.0] * self.dimensions
+        for word in re.findall(r"\w+", text.lower()):
+            digest = hashlib.sha256(word.encode()).digest()
+            vector[digest[0] % self.dimensions] += 1.0
+        norm = math.sqrt(sum(v * v for v in vector)) or 1.0
+        return [v / norm for v in vector]
+
+    async def embed_documents(self, texts):
+        self.calls += 1
+        return [self._vector(text) for text in texts]
+
+    async def embed_query(self, text):
+        self.calls += 1
+        return self._vector(text)
+
+
+class CountingProvider(LLMProvider):
+    """Counts calls and records prompts; replies with a fixed string."""
+
+    def __init__(self, name: str, reply: str) -> None:
+        super().__init__(api_key="stub", model="stub")
+        self.name = name
+        self.reply = reply
+        self.calls = 0
+        self.prompts: list[str] = []
+        self.images_seen = 0
+
+    async def complete(self, *, prompt: str, images=None, **_kwargs) -> str:
+        self.calls += 1
+        self.prompts.append(prompt)
+        self.images_seen += len(images or [])
+        return self.reply
+
+
+async def knowledge_offline_checks() -> None:
+    """Phase 5a: isolation, threshold, grounding, PII gate, migration — no network."""
+    from harness.documents import DocumentArchive
+    from harness.knowledge import AnswerStatus, KnowledgeBase, KnowledgeError
+    from providers.base import ImagePart, ProviderError, UnsupportedFeature
+    from providers.openai_compatible import GroqProvider
+    from storage.knowledge import KnowledgeStore
+    from tools import rag
+
+    print("\nRAG chunking:")
+    page = "\n".join(f"Line {i}: " + "word " * 30 for i in range(20))
+    chunks = rag.chunk_text(page, max_chars=400)
+    check("long text split into several chunks", len(chunks) > 1)
+    check("every chunk within the size limit", all(len(c) <= 400 for c in chunks))
+    check(
+        "consecutive chunks overlap by a line",
+        chunks[0].splitlines()[-1] == chunks[1].splitlines()[0],
+    )
+    check("blank text -> no chunks", rag.chunk_text("  \n \n") == [])
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        key = Fernet.generate_key()
+        embedder = HashEmbedder()
+        store = KnowledgeStore(
+            db_path=Path(tmp) / "knowledge.db",
+            page_dir=Path(tmp) / "pages",
+            encryption_key=key,
+            embedding_model=embedder.model_id,
+            dimensions=embedder.dimensions,
+        )
+        await store.connect()
+        notes = NoteStore(Path(tmp) / "notes.db")
+        await notes.connect()
+        documents = DocumentStore(
+            db_path=Path(tmp) / "documents.db", scan_dir=Path(tmp) / "scans", encryption_key=key
+        )
+        await documents.connect()
+        try:
+            answer_json = json.dumps({"answerable": True, "answer": "Тилакоид [1]", "sources": [1]})
+            answer_llm = CountingProvider("answer-stub", answer_json)
+            kb = KnowledgeBase(
+                store=store,
+                embedder=embedder,
+                router=LLMRouter([answer_llm]),
+                vision_router=None,
+                note_store=notes,
+                top_k=5,
+                min_score=0.5,
+            )
+
+            user_a, user_b = 111, 222
+            photo = b"\xff\xd8 fake jpeg bytes of user A's notebook page"
+            src_a = await store.add_source(
+                telegram_id=user_a,
+                kind="page",
+                title="photosynthesis",
+                chunks=["photosynthesis light phase thylakoid membrane chlorophyll"],
+                embeddings=await embedder.embed_documents(
+                    ["photosynthesis light phase thylakoid membrane chlorophyll"]
+                ),
+                photo=photo,
+            )
+            secret_b = "user B private diary entry secret password hint"
+            await store.add_source(
+                telegram_id=user_b,
+                kind="note",
+                title="diary",
+                chunks=[secret_b, "photosynthesis light phase thylakoid membrane chlorophyll"],
+                embeddings=await embedder.embed_documents(
+                    [secret_b, "photosynthesis light phase thylakoid membrane chlorophyll"]
+                ),
+            )
+
+            print("\nKnowledge base: per-user isolation:")
+            a_chunks: set[int] = set()
+            for query in (secret_b, "photosynthesis thylakoid", "diary password", "anything"):
+                hits = await store.search(
+                    telegram_id=user_a, embedding=embedder._vector(query), k=50
+                )
+                a_chunks |= {h.chunk_id for h in hits}
+                check(
+                    f"user A's search for {query!r} returns only A's chunks",
+                    all(h.source.telegram_id == user_a for h in hits),
+                )
+            check("A never sees B's identical-text chunk or secret", len(a_chunks) == 1)
+            b_hits = await store.search(
+                telegram_id=user_b, embedding=embedder._vector(secret_b), k=50
+            )
+            check("B still finds B's own secret", b_hits and b_hits[0].text == secret_b)
+            check(
+                "B's search never returns A's chunk",
+                all(h.source.telegram_id == user_b for h in b_hits),
+            )
+            check(
+                "B cannot load A's page photo by id",
+                await store.load_photo(telegram_id=user_b, source_id=src_a.id) is None,
+            )
+            empty = await kb.ask(telegram_id=333, question="photosynthesis", user_message="")
+            check(
+                "a user with no notes gets nothing (no fallback to others' data)",
+                empty.status is AnswerStatus.NOTHING_RELEVANT and not empty.hits,
+            )
+
+            print("\nKnowledge base: threshold and grounding:")
+            calls_before = answer_llm.calls
+            off_topic = await kb.ask(
+                telegram_id=user_a, question="football match winner", user_message=""
+            )
+            check(
+                "off-topic question -> NOTHING_RELEVANT",
+                off_topic.status is AnswerStatus.NOTHING_RELEVANT,
+            )
+            check("... without calling the LLM at all", answer_llm.calls == calls_before)
+
+            result = await kb.ask(
+                telegram_id=user_a,
+                question="photosynthesis light phase thylakoid",
+                user_message="/ask фотосинтез жарық фазасы",
+            )
+            check("relevant question -> ANSWERED", result.status is AnswerStatus.ANSWERED)
+            check("source reference is A's page", [s.id for s in result.sources] == [src_a.id])
+            check("original page photo returned, decrypted", result.photo == photo)
+            check(
+                "page photo is encrypted at rest",
+                photo not in (Path(tmp) / "pages" / src_a.photo_filename).read_bytes(),
+            )
+            prompt = answer_llm.prompts[-1]
+            check("Kazakh question -> reply language Kazakh", "(Reply language: Kazakh.)" in prompt)
+            await kb.ask(
+                telegram_id=user_a,
+                question="фотосинтез световая фаза",
+                user_message="/ask фотосинтез световая фаза",
+            )
+            check(
+                "Russian question -> Kazakh, never Russian",
+                "(Reply language: Kazakh.)" in answer_llm.prompts[-1],
+            )
+            await kb.ask(
+                telegram_id=user_a,
+                question="photosynthesis light phase",
+                user_message="/ask where does the photosynthesis light phase happen",
+            )
+            check(
+                "English question -> English",
+                "(Reply language: English.)" in answer_llm.prompts[-1],
+            )
+
+            answer_llm.reply = json.dumps({"answerable": False, "answer": "", "sources": []})
+            refused = await kb.ask(
+                telegram_id=user_a, question="photosynthesis thylakoid", user_message=""
+            )
+            check(
+                "model finds no answer -> NOT_IN_NOTES (static reply)",
+                refused.status is AnswerStatus.NOT_IN_NOTES,
+            )
+
+            print("\nKnowledge base: staging-note migration:")
+            for i in range(2):
+                await notes.save(
+                    telegram_id=user_a,
+                    kind="screenshot",
+                    title=f"note {i}",
+                    content_md=f"Ohm law current voltage resistance {i}",
+                    content_json="{}",
+                    tags=[],
+                )
+            check("first migration indexes both notes", await kb.migrate_staging_notes() == 2)
+            check("second migration is a no-op (idempotent)", await kb.migrate_staging_notes() == 0)
+            hits = await store.search(
+                telegram_id=user_a, embedding=embedder._vector("Ohm law voltage"), k=5
+            )
+            check("migrated notes are searchable", hits[0].source.kind == "note")
+
+            print("\nKnowledge base: PII gate before any cloud vision call:")
+            import harness.knowledge as knowledge_module
+
+            vision_llm = CountingProvider("vision-stub", "Some handwritten text")
+            archive = DocumentArchive(store=documents, tesseract_cmd=None, ocr_lang="eng")
+            gated = KnowledgeBase(
+                store=store,
+                embedder=embedder,
+                router=LLMRouter([answer_llm]),
+                vision_router=LLMRouter([vision_llm]),
+                document_archive=archive,
+            )
+            gate_text = {"value": SAMPLE_PASSPORT_OCR}
+
+            async def fake_local_ocr(_image, **_kwargs):
+                return gate_text["value"]
+
+            real_extract = knowledge_module.ocr.extract_text
+            knowledge_module.ocr.extract_text = fake_local_ocr
+            import tools.ocr as ocr_module
+
+            ocr_module_extract = ocr_module.extract_text
+            ocr_module.extract_text = fake_local_ocr  # DocumentArchive.ingest uses it too
+            try:
+                gated._tesseract_path = "fake-tesseract"
+                archive._tesseract_path = "fake-tesseract"
+                capture = await gated.ingest_page(telegram_id=user_a, image_bytes=b"passport photo")
+                check(
+                    "passport page redirected to the encrypted archive",
+                    capture.redirected_to_documents,
+                )
+                check("... and the vision chain was NEVER called", vision_llm.calls == 0)
+                check("... nothing about it reached the index", not capture.sent_to_vision)
+
+                gate_text["value"] = "Биология\nфотосинтез"
+                vision_llm.reply = "Биология 9 класс\nСветовая фаза: тилакоиды"
+                capture = await gated.ingest_page(
+                    telegram_id=user_a, image_bytes=b"notebook photo", title_hint=""
+                )
+                check(
+                    "clean page goes to the vision chain",
+                    vision_llm.calls == 1 and vision_llm.images_seen == 1,
+                )
+                check(
+                    "clean page indexed with its photo",
+                    capture.source and capture.source.photo_filename,
+                )
+                check("title taken from the first line", capture.source.title == "Биология 9 класс")
+
+                vision_llm.reply = "Менің ЖСН: 900101300123"  # handwritten IIN Tesseract missed
+                capture = await gated.ingest_page(telegram_id=user_a, image_bytes=b"page with iin")
+                check(
+                    "PII found only by vision -> archive, not index",
+                    capture.redirected_to_documents and capture.sent_to_vision,
+                )
+
+                gated._tesseract_path = None
+                calls = vision_llm.calls
+                try:
+                    await gated.ingest_page(telegram_id=user_a, image_bytes=b"any page")
+                except KnowledgeError:
+                    check("no local OCR -> page refused (fails closed)", vision_llm.calls == calls)
+                else:
+                    check("no local OCR -> page refused (fails closed)", False)
+            finally:
+                knowledge_module.ocr.extract_text = real_extract
+                ocr_module.extract_text = ocr_module_extract
+
+            print("\nKnowledge base: pinned embedding model:")
+            await store.close()
+            other = KnowledgeStore(
+                db_path=Path(tmp) / "knowledge.db",
+                page_dir=Path(tmp) / "pages",
+                encryption_key=key,
+                embedding_model="another-model@64",
+                dimensions=64,
+            )
+            try:
+                await other.connect()
+            except Exception as exc:
+                check("opening with a different model is refused", "not comparable" in str(exc))
+            else:
+                await other.close()
+                check("opening with a different model is refused", False)
+        finally:
+            await store.close()
+            await notes.close()
+            await documents.close()
+
+    print("\nProviders (Phase 5a hardening):")
+    groq = GroqProvider(api_key="stub", model="openai/gpt-oss-120b", reasoning_effort="low")
+    try:
+        groq._extract_text(
+            {
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                "usage": {"completion_tokens_details": {"reasoning_tokens": 512}},
+            }
+        )
+    except ProviderError as exc:
+        check("reasoning ate max_tokens -> explicit error", "max_tokens exhausted" in str(exc))
+    try:
+        await groq.complete(prompt="x", images=[ImagePart(b"img")])
+    except UnsupportedFeature:
+        check("text-only model refuses images locally (no request sent)", True)
+    else:
+        check("text-only model refuses images locally (no request sent)", False)
+
+
+LIVE_STAGING_NOTES = [
+    # (title, verbatim OCR-style text) — typed screenshots, like Phase 4 /note rows.
+    (
+        "Физика: закон Ома",
+        "Закон Ома для участка цепи:\nI = U / R\nСопротивление измеряется в омах (Ом).",
+    ),
+    (
+        "Алгебра: дискриминант",
+        "Квадрат теңдеу ax² + bx + c = 0\nD = b² − 4ac\nD < 0 болса, нақты түбір жоқ.",
+    ),
+]
+
+
+async def knowledge_live_check(image_paths: list[str], questions: list[str]) -> None:
+    """Real pipeline in a throwaway temp dir: local Tesseract PII gate -> real
+    vision chain -> real Gemini embeddings -> real answer chain. Prints every
+    retrieved chunk with its score, then the answer exactly as /ask would."""
+    from config import load_settings
+    from harness.documents import DocumentArchive
+    from harness.knowledge import AnswerStatus, KnowledgeBase
+    from llm_router import build_embedder, build_router, build_vision_router
+    from storage.knowledge import KnowledgeStore
+
+    settings = load_settings()
+    router = build_router(settings)
+    vision = build_vision_router(settings)
+    embedder = build_embedder(settings)
+    assert embedder is not None, "GEMINI_API_KEY is required for the knowledge base"
+    user = 1  # throwaway id in a throwaway store
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        store = KnowledgeStore(
+            db_path=Path(tmp) / "knowledge.db",
+            page_dir=Path(tmp) / "pages",
+            encryption_key=settings.documents_encryption_key,
+            embedding_model=embedder.model_id,
+            dimensions=settings.embedding_dim,
+        )
+        notes = NoteStore(Path(tmp) / "notes.db")
+        documents = DocumentStore(
+            db_path=Path(tmp) / "documents.db",
+            scan_dir=Path(tmp) / "scans",
+            encryption_key=settings.documents_encryption_key,
+        )
+        for resource in (store, notes, documents):
+            await resource.connect()
+        archive = DocumentArchive(
+            store=documents,
+            tesseract_cmd=settings.tesseract_cmd,
+            ocr_lang=settings.ocr_lang,
+            ocr_tessdata_dir=settings.ocr_tessdata_dir,
+        )
+        kb = KnowledgeBase(
+            store=store,
+            embedder=embedder,
+            router=router,
+            vision_router=vision,
+            note_store=notes,
+            document_archive=archive,
+            tesseract_cmd=settings.tesseract_cmd,
+            ocr_lang=settings.ocr_lang,
+            ocr_tessdata_dir=settings.ocr_tessdata_dir,
+            top_k=settings.rag_top_k,
+            min_score=settings.rag_min_score,
+        )
+        print("\n" + kb.describe())
+        try:
+            print("\n== Ingestion ==")
+            for path in image_paths:
+                capture = await kb.ingest_page(
+                    telegram_id=user, image_bytes=Path(path).read_bytes()
+                )
+                if capture.redirected_to_documents:
+                    print(
+                        f"\n[{Path(path).name}] PII gate fired -> document archive "
+                        f"(type={capture.document.document_type}, "
+                        f"sent_to_vision={capture.sent_to_vision})"
+                    )
+                    continue
+                print(
+                    f"\n[{Path(path).name}] indexed as {capture.source.title!r} via "
+                    f"{capture.transcribed_by}, {capture.chunk_count} chunk(s):"
+                )
+                print("    " + capture.transcription.replace("\n", "\n    "))
+            for title, text in LIVE_STAGING_NOTES:
+                await notes.save(
+                    telegram_id=user,
+                    kind="screenshot",
+                    title=title,
+                    content_md=text,
+                    content_json="{}",
+                    tags=[],
+                )
+            print(f"\nmigrated {await kb.migrate_staging_notes()} staging note(s)")
+
+            for question in questions:
+                result = await kb.ask(
+                    telegram_id=user, question=question, user_message=f"/ask {question}"
+                )
+                print(f"\n== /ask {question}")
+                for hit in result.hits[:3]:
+                    mark = "PASS" if hit.score >= kb.min_score else "below"
+                    text = hit.text.replace("\n", " / ")
+                    print(
+                        f"    {hit.score:.3f} [{mark}] "
+                        f"{hit.source.kind}:{hit.source.title!r}: {text[:90]}"
+                    )
+                print(f"  status: {result.status.value}")
+                if result.status is AnswerStatus.ANSWERED:
+                    print("  answer: " + result.answer.replace("\n", "\n          "))
+                    print(
+                        "  sources: " + "; ".join(f"{s.kind} {s.title!r}" for s in result.sources)
+                    )
+                    print(f"  page photo returned: {len(result.photo or b'')} bytes")
+        finally:
+            for resource in (store, notes, documents):
+                await resource.close()
+            await router.aclose()
+            await embedder.aclose()
+            if vision is not None:
+                await vision.aclose()
+
+
+async def archive_fallback_and_delete_checks() -> None:
+    """/find raw-text fallback for field-less documents, and /delete scoping."""
+    print("\nDocument archive: /find falls back to raw OCR text:")
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        store = DocumentStore(
+            db_path=Path(tmp) / "documents.db",
+            scan_dir=Path(tmp) / "scans",
+            encryption_key=Fernet.generate_key(),
+        )
+        await store.connect()
+        try:
+            text = SYNTHETIC_TEXTBOOK_PAGES["kk chemistry worksheet"]
+            unknown = await store.save(
+                telegram_id=1,
+                document_type="unknown",
+                fields={},
+                raw_text=text,
+                image_bytes=b"worksheet scan",
+            )
+            other_users = await store.save(
+                telegram_id=2,
+                document_type="unknown",
+                fields={},
+                raw_text=text,
+                image_bytes=b"someone else's scan",
+            )
+            match = await store.search(telegram_id=1, query="молярлық көлем есебі")
+            check(
+                "field-less document found via its OCR text",
+                match and match.record.id == unknown.id,
+            )
+            check(
+                "matched lines returned for display",
+                match is not None and any("көлемі" in line for line in match.matched_lines),
+            )
+            check(
+                "fallback never returns another user's document",
+                match is not None and match.record.telegram_id == 1,
+            )
+            weak = await store.search(telegram_id=1, query="футбол чемпионаты нәтижесі көлем")
+            check("one shared word out of four is not a match", weak is None)
+
+            print("\nDocument archive: /delete:")
+            check(
+                "user 1 cannot delete user 2's document",
+                await store.delete(telegram_id=1, document_id=other_users.id) is None,
+            )
+            check("... which is still there", other_users.scan_path.exists())
+            deleted = await store.delete(telegram_id=1, document_id=unknown.id)
+            check("owner deletes their document", deleted is not None and deleted.id == unknown.id)
+            check("... encrypted scan file removed", not unknown.scan_path.exists())
+            check(
+                "... and it is no longer findable",
+                await store.search(telegram_id=1, query="молярлық көлем есебі") is None,
+            )
+            check(
+                "deleting again -> not found",
+                await store.delete(telegram_id=1, document_id=unknown.id) is None,
+            )
+        finally:
+            await store.close()
+
+
+async def ask_outcome_logging_checks() -> None:
+    """Every /ask logs best score and whether a refusal came from the
+    threshold or from the model's "unanswerable" flag."""
+    import logging
+
+    from harness.knowledge import KnowledgeBase
+    from storage.knowledge import KnowledgeStore
+
+    print("\n/ask outcome logging:")
+    records: list[logging.LogRecord] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    kb_logger = logging.getLogger("harness.knowledge")
+    handler = Capture()
+    kb_logger.addHandler(handler)
+    previous_level = kb_logger.level
+    kb_logger.setLevel(logging.INFO)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        embedder = HashEmbedder()
+        store = KnowledgeStore(
+            db_path=Path(tmp) / "k.db",
+            page_dir=Path(tmp) / "p",
+            encryption_key=Fernet.generate_key(),
+            embedding_model=embedder.model_id,
+            dimensions=embedder.dimensions,
+        )
+        await store.connect()
+        try:
+            chunk = "ohm law current voltage resistance"
+            await store.add_source(
+                telegram_id=1,
+                kind="note",
+                title="ohm",
+                chunks=[chunk],
+                embeddings=await embedder.embed_documents([chunk]),
+            )
+            llm = CountingProvider(
+                "stub", json.dumps({"answerable": True, "answer": "I = U/R [1]", "sources": [1]})
+            )
+            kb = KnowledgeBase(
+                store=store, embedder=embedder, router=LLMRouter([llm]), vision_router=None,
+                min_score=0.5,
+            )  # fmt: skip
+
+            def last_outcome() -> str:
+                lines = [r.getMessage() for r in records if "kb /ask" in r.getMessage()]
+                return lines[-1] if lines else ""
+
+            await kb.ask(telegram_id=1, question="football", user_message="")
+            line = last_outcome()
+            check(f"threshold refusal logged: {line!r}", "outcome=refused:threshold" in line)
+            check("... with the best score", "best=" in line and "best=none" not in line)
+            llm.reply = json.dumps({"answerable": False, "answer": "", "sources": []})
+            await kb.ask(telegram_id=1, question="ohm law voltage", user_message="")
+            line = last_outcome()
+            check(f"model refusal logged: {line!r}", "outcome=refused:model" in line)
+            llm.reply = json.dumps({"answerable": True, "answer": "I = U/R [1]", "sources": [1]})
+            await kb.ask(telegram_id=1, question="ohm law voltage", user_message="")
+            line = last_outcome()
+            check(f"answer logged: {line!r}", "outcome=answered" in line and "cited=[1]" in line)
+            await kb.ask(telegram_id=99, question="ohm", user_message="")
+            check("empty index logs best=none", "best=none" in last_outcome())
+            check(
+                "question text never logged",
+                not any("ohm law voltage" in r.getMessage() for r in records),
+            )
+        finally:
+            await store.close()
+            kb_logger.removeHandler(handler)
+            kb_logger.setLevel(previous_level)
 
 
 async def download_check(url: str, *, convert_to_mp3: bool) -> None:
@@ -899,6 +1685,14 @@ async def main() -> None:
         await download_check(sys.argv[index + 1], convert_to_mp3=convert_to_mp3)
         print("\nDownload check passed.")
         return
+    if "--kb" in sys.argv:
+        # --kb page1.jpg page2.jpg ... --q "question 1" --q "question 2"
+        args = sys.argv[sys.argv.index("--kb") + 1 :]
+        images = [a for a in args[: args.index("--q")] if a] if "--q" in args else args
+        questions = [args[i + 1] for i, a in enumerate(args) if a == "--q" and i + 1 < len(args)]
+        await knowledge_live_check(images, questions)
+        print("\nKnowledge-base live check finished.")
+        return
     if "--screenshot" in sys.argv:
         index = sys.argv.index("--screenshot")
         if index + 1 >= len(sys.argv):
@@ -916,6 +1710,10 @@ async def main() -> None:
     await routing_offline_checks()
     formatting_offline_checks()
     download_format_offline_checks()
+    await knowledge_offline_checks()
+    pii_gate_regression_checks()
+    await archive_fallback_and_delete_checks()
+    await ask_outcome_logging_checks()
     if "--live" in sys.argv:
         await live_check()
     print("\nAll checks passed.")

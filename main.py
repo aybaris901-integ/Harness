@@ -11,9 +11,10 @@ import sys
 
 from bot import create_bot, create_dispatcher, set_bot_commands
 from config import ConfigError, Settings, load_settings
-from harness import DocumentArchive, Harness, LinkSummarizer, MediaPipeline
-from llm_router import build_router
+from harness import DocumentArchive, Harness, KnowledgeBase, LinkSummarizer, MediaPipeline
+from llm_router import build_embedder, build_router, build_vision_router
 from storage import DocumentStore, NoteStore, Storage
+from storage.knowledge import KnowledgeStore, KnowledgeStoreError
 from tools.transcriber import Transcriber
 
 logger = logging.getLogger("harness")
@@ -57,6 +58,43 @@ async def run(settings: Settings) -> None:
     await note_store.connect()
 
     llm = build_router(settings)
+
+    # Phase 5a: the knowledge base needs an embedding model; without a Gemini
+    # key it is disabled and /ask, /page reply with a static notice.
+    embedder = build_embedder(settings)
+    vision = build_vision_router(settings)
+    knowledge_store: KnowledgeStore | None = None
+    knowledge: KnowledgeBase | None = None
+    if embedder is None:
+        logger.warning("GEMINI_API_KEY not set — knowledge base (/ask, /page) disabled")
+    else:
+        knowledge_store = KnowledgeStore(
+            db_path=settings.knowledge_db_path,
+            page_dir=settings.knowledge_page_dir,
+            encryption_key=settings.documents_encryption_key,
+            embedding_model=embedder.model_id,
+            dimensions=settings.embedding_dim,
+        )
+        try:
+            await knowledge_store.connect()
+        except KnowledgeStoreError as exc:
+            # Refuse to start rather than silently run without the index the
+            # user expects — the message says exactly what to fix.
+            raise SystemExit(f"Knowledge store error: {exc}") from exc
+        knowledge = KnowledgeBase(
+            store=knowledge_store,
+            embedder=embedder,
+            router=llm,
+            vision_router=vision,
+            note_store=note_store,
+            document_archive=archive,
+            tesseract_cmd=settings.tesseract_cmd,
+            ocr_lang=settings.ocr_lang,
+            ocr_tessdata_dir=settings.ocr_tessdata_dir,
+            top_k=settings.rag_top_k,
+            min_score=settings.rag_min_score,
+        )
+        logger.info(knowledge.describe())
     transcriber = Transcriber(
         backend=settings.stt_backend,
         groq_api_key=settings.groq.api_key,
@@ -85,6 +123,7 @@ async def run(settings: Settings) -> None:
         max_download_mb=settings.media_max_download_mb,
         max_concurrent_downloads=settings.media_max_concurrent,
         document_archive=archive,
+        knowledge=knowledge,
     )
     logger.info(media.describe())
 
@@ -95,7 +134,14 @@ async def run(settings: Settings) -> None:
         storage=storage,
         archive=archive,
         media=media,
+        knowledge=knowledge,
     )
+
+    migration: asyncio.Task[int] | None = None
+    if knowledge is not None:
+        # Phase 4 staging notes -> index. Idempotent, so it runs every start;
+        # in the background so embedding calls never delay polling.
+        migration = asyncio.create_task(knowledge.migrate_staging_notes(), name="kb-migration")
 
     try:
         me = await bot.get_me()
@@ -109,7 +155,15 @@ async def run(settings: Settings) -> None:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
+        if migration is not None and not migration.done():
+            migration.cancel()
         await llm.aclose()
+        if vision is not None:
+            await vision.aclose()
+        if embedder is not None:
+            await embedder.aclose()
+        if knowledge_store is not None:
+            await knowledge_store.close()
         await storage.close()
         await document_store.close()
         await note_store.close()
